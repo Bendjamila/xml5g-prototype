@@ -1,0 +1,729 @@
+# xML5G — phase 1 : reconstruction de la plateforme OAI + FlexRIC (rfsim)
+# et test de la libération d'un UE par une vraie commande E2SM-RC.
+# Ce fichier se suffit à lui-même : il télécharge OAI et FlexRIC (versions
+# figées), applique le correctif xML5G, compile, démarre le cœur 5G, le RIC,
+# le gNB et deux UEs, puis libère un UE et vérifie que l'autre n'est pas touché.
+# Le bilan s'affiche sur la page de l'exécution ; tous les journaux sont
+# téléchargeables en bas de cette page (« Artifacts »).
+
+name: xML5G phase 1
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/phase1.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  phase1:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      OAI_COMMIT: 1c2f4d3c2e68181cdef9f426d161163147ad4b77
+      FLEXRIC_COMMIT: d7a71285f3720fbc1487e9a86309eec5fb61a408
+      WORK: /home/runner/xml5g
+      LOGS: /home/runner/xml5g-journaux
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 1. Libérer de l'espace disque
+        run: |
+
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          docker image prune -a -f > /dev/null 2>&1 || true
+          mkdir -p "$WORK" "$LOGS"
+          df -h / | tee "$LOGS/00_disque.txt"
+      - name: 2. Préparer la machine (SCTP, routage)
+        run: |
+
+          sudo modprobe sctp || { sudo apt-get update -q && sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe sctp; }
+          lsmod | grep sctp | tee "$LOGS/01_sctp.txt"
+          sudo sysctl -w net.ipv4.ip_forward=1
+          { uname -a; nproc; lscpu | head -20; free -h; } > "$LOGS/01_machine.txt"
+          cat "$LOGS/01_machine.txt"
+      - name: 3. Récupérer OAI et FlexRIC (versions figées)
+        run: |
+
+          cd "$WORK"
+          git init -q oai && cd oai
+          git remote add origin https://github.com/duranta-project/openairinterface5g.git
+          git fetch -q --depth 1 origin "$OAI_COMMIT" && git checkout -q FETCH_HEAD
+          cd openair2/E2AP && rm -rf flexric && git init -q flexric && cd flexric
+          git remote add origin https://github.com/duranta-project/flexric.git
+          git fetch -q --depth 1 origin "$FLEXRIC_COMMIT" && git checkout -q FETCH_HEAD
+          { echo "OAI     $(git -C "$WORK/oai" rev-parse HEAD)"; echo "FlexRIC $(git rev-parse HEAD)"; } | tee "$LOGS/02_versions.txt"
+      - name: 4. Appliquer le correctif xML5G et ajouter l'xApp
+        run: |
+          cd "$WORK/oai"
+          cat > "$WORK/xml5g.patch" <<'XML5G_PATCH_EOF'
+          diff --git a/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c b/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c
+          index fa8b409..b64460e 100644
+          --- a/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c
+          +++ b/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c
+          @@ -15,9 +15,11 @@
+           #include "openair2/RRC/NR/rrc_gNB_du.h"
+           #include "openair2/RRC/NR/rrc_gNB_mobility.h"
+           #include "openair2/RRC/NR/nr_rrc_proto.h"
+          +#include "openair2/RRC/NR/rrc_gNB_NGAP.h"
+
+           #include <stdio.h>
+           #include <unistd.h>
+          +#include <time.h>
+           #include "common/ran_context.h"
+
+           static pthread_once_t once_rc_mutex = PTHREAD_ONCE_INIT;
+          @@ -448,12 +450,18 @@ static void fill_rc_radio_bearer_ctrl(seq_ctrl_style_t* ctrl_style)
+             ctrl_style->ran_param_ctrl_out = NULL;
+           }
+
+          -/* RIC Control Style Types, 7.6. Only the two below are implemented. */
+          +/* RIC Control Style Types, 7.6. Only the three below are implemented. */
+           typedef enum {
+             RC_CTRL_STYLE_RADIO_BEARER = 1,
+             RC_CTRL_STYLE_CONN_MODE_MOBILITY = 3,
+          +  RC_CTRL_STYLE_RADIO_ACCESS = 4,
+           } rc_ctrl_style_type_e;
+
+          +/* xML5G: Radio Access Control (E2SM-RC v01.03, 7.6.5), control action
+          + * "RRC Connection Release". The same value is used by the xML5G xApp; both
+          + * sides also check the action advertised at E2 Setup. */
+          +#define XML5G_RRC_CONNECTION_RELEASE_7_6_5 3
+          +
+           /** @brief Add a leaf RAN parameter (no nested definition) to a LIST/STRUCTURE item */
+           static void fill_ran_param_leaf(ran_param_lst_struct_t* dst, uint32_t id, const char* name)
+           {
+          @@ -553,16 +561,62 @@ static void fill_rc_conn_mode_mobility_ctrl(seq_ctrl_style_t* ctrl_style)
+             ctrl_style->ran_param_ctrl_out = NULL;
+           }
+
+          +/** @brief Advertise CONTROL Style 4 "Radio access control", 7.6.5 (xML5G)
+          + *
+          + * Only the RRC Connection Release action is offered. It targets the UE named
+          + * in the Control Header and carries no RAN parameter: the gNB asks the AMF to
+          + * release the UE context (NGAP UE Context Release Request), which removes the
+          + * UE's user-plane resources and leads to an RRC Release. */
+          +static void fill_rc_radio_access_ctrl(seq_ctrl_style_t* ctrl_style)
+          +{
+          +  // RIC Control Style Type. Mandatory. 9.3.3, 6.2.2.2
+          +  ctrl_style->style_type = RC_CTRL_STYLE_RADIO_ACCESS;
+          +
+          +  // RIC Control Style Name. Mandatory. 9.3.4. [1-150]
+          +  ctrl_style->name = cp_str_to_ba("Radio access control");
+          +
+          +  // RIC Control Header/Message/Outcome Format Type. Mandatory. 9.3.5
+          +  ctrl_style->hdr = FORMAT_1_E2SM_RC_CTRL_HDR;
+          +  ctrl_style->msg = FORMAT_1_E2SM_RC_CTRL_MSG;
+          +  ctrl_style->out_frmt = FORMAT_1_E2SM_RC_CTRL_OUT;
+          +
+          +  // RIC Call Process ID Format Type. Optional
+          +  ctrl_style->call_proc_id_type = NULL;
+          +
+          +  // Sequence of Control Actions. [0-65535]
+          +  ctrl_style->sz_seq_ctrl_act = 1;
+          +  ctrl_style->seq_ctrl_act = calloc(ctrl_style->sz_seq_ctrl_act, sizeof(seq_ctrl_act_2_t));
+          +  AssertFatal(ctrl_style->seq_ctrl_act != NULL, "Memory exhausted");
+          +
+          +  seq_ctrl_act_2_t* ctrl_act = &ctrl_style->seq_ctrl_act[0];
+          +
+          +  // Control Action ID. Mandatory. 9.3.6. [1-65535]
+          +  ctrl_act->id = XML5G_RRC_CONNECTION_RELEASE_7_6_5;
+          +
+          +  // Control Action Name. Mandatory. 9.3.7. [1-150]
+          +  ctrl_act->name = cp_str_to_ba("RRC Connection Release");
+          +
+          +  // Sequence of Associated RAN Parameters. [0-65535]: none, the UE is named
+          +  // in the Control Header
+          +  ctrl_act->sz_seq_assoc_ran_param = 0;
+          +  ctrl_act->assoc_ran_param = NULL;
+          +
+          +  // Sequence of Associated RAN Parameters for Control Outcome. [0-255]
+          +  ctrl_style->sz_ran_param_ctrl_out = 0;
+          +  ctrl_style->ran_param_ctrl_out = NULL;
+          +}
+          +
+           static void fill_rc_control(ran_func_def_ctrl_t* ctrl)
+           {
+             // Sequence of CONTROL styles
+             // [1 - 63]
+          -  ctrl->sz_seq_ctrl_style = 2;
+          +  ctrl->sz_seq_ctrl_style = 3;
+             ctrl->seq_ctrl_style = calloc(ctrl->sz_seq_ctrl_style, sizeof(seq_ctrl_style_t));
+             assert(ctrl->seq_ctrl_style != NULL && "Memory exhausted");
+
+             fill_rc_radio_bearer_ctrl(&ctrl->seq_ctrl_style[0]);
+             fill_rc_conn_mode_mobility_ctrl(&ctrl->seq_ctrl_style[1]);
+          +  fill_rc_radio_access_ctrl(&ctrl->seq_ctrl_style[2]);
+           }
+
+           static ran_function_name_t fill_rc_ran_func_name(void)
+          @@ -1365,6 +1419,50 @@ static void write_ctrl_conn_mode_mobility(rc_ctrl_req_data_t const* ctrl)
+             printf("[E2 AGENT] RC Control: N2 Handover Control for UE %u to neighbour NR Cell Identity %lu\n", rrc_ue_id, target_cell_id);
+             nr_rrc_trigger_n2_ho(RC.nrrrc[0], ue, neighbour);
+           }
+          +
+          +static int64_t xml5g_now_us(void)
+          +{
+          +  struct timespec ts;
+          +  clock_gettime(CLOCK_REALTIME, &ts);
+          +  return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+          +}
+          +
+          +/* xML5G - Radio access control, 7.6.5: release the UE named in the Control
+          + * Header. The release goes through the AMF (gNB-initiated NGAP UE Context
+          + * Release Request, TS 38.413 8.3.2), as for any network-initiated release, so
+          + * the UE's PDU sessions are also torn down at the UPF. */
+          +static void write_ctrl_radio_access(rc_ctrl_req_data_t const* ctrl)
+          +{
+          +  const int64_t t_rx = xml5g_now_us();
+          +
+          +  if (ctrl->hdr.frmt_1.ctrl_act_id != XML5G_RRC_CONNECTION_RELEASE_7_6_5) {
+          +    printf("[E2 AGENT] RC Control: Style 4 Action %d not supported, only RRC Connection Release\n", ctrl->hdr.frmt_1.ctrl_act_id);
+          +    return;
+          +  }
+          +  if (ctrl->hdr.frmt_1.ue_id.type != GNB_UE_ID_E2SM || ctrl->hdr.frmt_1.ue_id.gnb.ran_ue_id == NULL) {
+          +    printf("[E2 AGENT] RC Control: RRC Connection Release needs a gNB UE ID with RAN UE ID\n");
+          +    return;
+          +  }
+          +
+          +  const uint32_t rrc_ue_id = *ctrl->hdr.frmt_1.ue_id.gnb.ran_ue_id;
+          +  rrc_gNB_ue_context_t *ue_context_p = rrc_gNB_get_ue_context(RC.nrrrc[0], rrc_ue_id);
+          +  if (ue_context_p == NULL) {
+          +    printf("[E2 AGENT] RC Control: UE with rrc_ue_id %u not found. No release.\n", rrc_ue_id);
+          +    return;
+          +  }
+          +
+          +  const ngap_cause_t cause = {
+          +      .type = NGAP_CAUSE_RADIO_NETWORK,
+          +      .value = NGAP_CAUSE_RADIO_NETWORK_RELEASE_DUE_TO_NGRAN_GENERATED_REASON,
+          +  };
+          +  rrc_gNB_send_NGAP_UE_CONTEXT_RELEASE_REQ(0, ue_context_p, cause);
+          +
+          +  /* Greppable line for the measurement campaign: reception of the CONTROL
+          +   * and hand-over of the release to NGAP, both in CLOCK_REALTIME us. */
+          +  printf("[XML5G] E2SM-RC RRC Connection Release rrc_ue_id=%u t_ctrl_rx_us=%ld t_release_req_us=%ld\n",
+          +         rrc_ue_id, (long)t_rx, (long)xml5g_now_us());
+          +  fflush(stdout);
+          +}
+           #endif
+
+           sm_ag_if_ans_t write_ctrl_rc_sm(void const* data)
+          @@ -1391,6 +1489,14 @@ sm_ag_if_ans_t write_ctrl_rc_sm(void const* data)
+            #endif
+                 break;
+
+          +    case RC_CTRL_STYLE_RADIO_ACCESS:
+          + #ifdef NGRAN_GNB_CUCP
+          +      write_ctrl_radio_access(ctrl);
+          + #else
+          +      printf("[E2 AGENT] \"Radio Access Control\" not supported by %d.\n", get_e2_node_type());
+          + #endif
+          +      break;
+          +
+               default:
+                 printf("[E2 AGENT] RC Control Style %d not supported\n", ctrl->hdr.frmt_1.ric_style_type);
+                 break;
+          XML5G_PATCH_EOF
+          git apply --check "$WORK/xml5g.patch" && git apply "$WORK/xml5g.patch"
+          grep -c XML5G openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c | tee "$LOGS/03_correctif.txt"
+          X="$WORK/oai/openair2/E2AP/flexric/examples/xApp/c/rc_release"
+          mkdir -p "$X"
+          cat > "$X/xapp_rc_release.c" <<'XML5G_XAPP_EOF'
+          /*
+           * xML5G - UE release xApp (phase 1 of the prototype rebuild).
+           *
+           * 1. Asks the gNB, through an E2SM-RC REPORT Style 5 "On Demand Report", for
+           *    the list of connected UEs and their RAN UE ID.
+           * 2. Releases one UE through an E2SM-RC CONTROL, Style 4 "Radio access
+           *    control", action "RRC Connection Release" (E2SM-RC v01.03, 7.6.5).
+           *
+           * Target UE: environment variable XML5G_TARGET_RAN_UE_ID, otherwise the UE
+           * with the smallest RAN UE ID. Every step prints a greppable [XML5G] line with
+           * CLOCK_REALTIME timestamps in microseconds.
+           *
+           * Built inside FlexRIC (examples/xApp/c/rc_release), from the rc_handover
+           * example of the FlexRIC project.
+           */
+
+          #include "../../../../src/xApp/e42_xapp_api.h"
+          #include "../../../../src/sm/rc_sm/ie/rc_data_ie.h"
+          #include "../../../../src/sm/rc_sm/rc_sm_id.h"
+          #include "../../../../src/util/alg_ds/alg/defer.h"
+
+          #include <assert.h>
+          #include <errno.h>
+          #include <inttypes.h>
+          #include <semaphore.h>
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+          #include <unistd.h>
+
+          // E2SM-RC 7.6.5: Radio access control. Same values as the OAI agent patch.
+          static const uint32_t RC_CTRL_STYLE_RADIO_ACCESS = 4;
+          static const uint16_t XML5G_RRC_CONNECTION_RELEASE_7_6_5 = 3;
+
+          // E2SM-RC 7.4.6: On Demand Report.
+          static const uint32_t RC_REPORT_STYLE_ON_DEMAND = 5;
+
+          #define MAX_UES 64
+
+          typedef struct {
+            size_t n;
+            ue_id_e2sm_t ue_id[MAX_UES];
+          } ue_list_t;
+
+          static ue_list_t ues = {0};
+          static sem_t rc_ind_sem;
+
+          static int64_t now_us(void)
+          {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+          }
+
+          static size_t find_ran_func_idx(const sm_ran_function_t* rf, size_t sz, int id)
+          {
+            for (size_t i = 0; i < sz; i++)
+              if (rf[i].id == id)
+                return i;
+            return sz;
+          }
+
+          /* Whether the E2 node advertised Radio access control / RRC Connection Release. */
+          static bool supports_release_ctrl(const ran_func_def_ctrl_t* ctrl)
+          {
+            if (ctrl == NULL)
+              return false;
+            for (size_t i = 0; i < ctrl->sz_seq_ctrl_style; i++) {
+              const seq_ctrl_style_t* style = &ctrl->seq_ctrl_style[i];
+              if (style->style_type != RC_CTRL_STYLE_RADIO_ACCESS)
+                continue;
+              for (size_t j = 0; j < style->sz_seq_ctrl_act; j++)
+                if (style->seq_ctrl_act[j].id == XML5G_RRC_CONNECTION_RELEASE_7_6_5)
+                  return true;
+            }
+            return false;
+          }
+
+          /* Whether the E2 node advertised REPORT Style 5 with UE Context Information. */
+          static bool supports_on_demand_ue_ctx(const ran_func_def_report_t* report)
+          {
+            if (report == NULL)
+              return false;
+            for (size_t i = 0; i < report->sz_seq_report_sty; i++) {
+              const seq_report_sty_t* style = &report->seq_report_sty[i];
+              if (style->report_type != RC_REPORT_STYLE_ON_DEMAND)
+                continue;
+              for (size_t j = 0; j < style->sz_seq_ran_param; j++)
+                if (style->ran_param[j].id == E2SM_RC_RS5_UE_CONTEXT_INFORMATION)
+                  return true;
+            }
+            return false;
+          }
+
+          /* REPORT Style 5 (On Demand), Event Trigger Format 5, UE Context Information only. */
+          static rc_sub_data_t gen_rc_sub_on_demand(void)
+          {
+            rc_sub_data_t rc_sub = {0};
+
+            rc_sub.et.format = FORMAT_5_E2SM_RC_EV_TRIGGER_FORMAT;
+            rc_sub.et.frmt_5.on_demand = TRUE_ON_DEMAND_FRMT_5;
+            rc_sub.et.frmt_5.assoc_ue_info = NULL;
+            rc_sub.et.frmt_5.assoc_cell_info = NULL;
+
+            rc_sub.sz_ad = 1;
+            rc_sub.ad = calloc(rc_sub.sz_ad, sizeof(e2sm_rc_action_def_t));
+            assert(rc_sub.ad != NULL && "Memory exhausted");
+            rc_sub.ad[0].ric_style_type = RC_REPORT_STYLE_ON_DEMAND;
+            rc_sub.ad[0].format = FORMAT_1_E2SM_RC_ACT_DEF;
+            rc_sub.ad[0].frmt_1.sz_param_report_def = 1;
+            rc_sub.ad[0].frmt_1.param_report_def = calloc(1, sizeof(param_report_def_t));
+            assert(rc_sub.ad[0].frmt_1.param_report_def != NULL && "Memory exhausted");
+            rc_sub.ad[0].frmt_1.param_report_def[0].ran_param_id = E2SM_RC_RS5_UE_CONTEXT_INFORMATION;
+            rc_sub.ad[0].frmt_1.param_report_def[0].ran_param_def = NULL;
+
+            return rc_sub;
+          }
+
+          /* One On Demand Report indication: keep every connected UE. */
+          static void sm_cb_rc(sm_ag_if_rd_t const* rd)
+          {
+            assert(rd != NULL);
+            assert(rd->type == INDICATION_MSG_AGENT_IF_ANS_V0);
+
+            if (rd->ind.rc.ind.msg.format == FORMAT_4_E2SM_RC_IND_MSG) {
+              const e2sm_rc_ind_msg_frmt_4_t* msg = &rd->ind.rc.ind.msg.frmt_4;
+              for (size_t i = 0; i < msg->sz_seq_ue_info && ues.n < MAX_UES; i++)
+                ues.ue_id[ues.n++] = cp_ue_id_e2sm(&msg->seq_ue_info[i].ue_id);
+            }
+            sem_post(&rc_ind_sem);
+          }
+
+          static bool has_ran_ue_id(const ue_id_e2sm_t* id)
+          {
+            return id->type == GNB_UE_ID_E2SM && id->gnb.ran_ue_id != NULL;
+          }
+
+          /* CONTROL: Style 4, action RRC Connection Release, no RAN parameter. */
+          static rc_ctrl_req_data_t gen_release_ctrl(const ue_id_e2sm_t* target)
+          {
+            rc_ctrl_req_data_t dst = {0};
+
+            dst.hdr.format = FORMAT_1_E2SM_RC_CTRL_HDR;
+            dst.hdr.frmt_1.ric_style_type = RC_CTRL_STYLE_RADIO_ACCESS;
+            dst.hdr.frmt_1.ctrl_act_id = XML5G_RRC_CONNECTION_RELEASE_7_6_5;
+            dst.hdr.frmt_1.ue_id = cp_ue_id_e2sm(target);
+
+            dst.msg.format = FORMAT_1_E2SM_RC_CTRL_MSG;
+            dst.msg.frmt_1.sz_ran_param = 0;
+            dst.msg.frmt_1.ran_param = NULL;
+
+            return dst;
+          }
+
+          int main(int argc, char* argv[])
+          {
+            fr_args_t args = init_fr_args(argc, argv);
+            init_xapp_api(&args);
+            sleep(1);
+
+            e2_node_arr_xapp_t nodes = e2_nodes_xapp_api();
+            defer({ free_e2_node_arr_xapp(&nodes); });
+
+            if (nodes.len == 0) {
+              fprintf(stderr, "[XML5G] no E2 node connected\n");
+              return EXIT_FAILURE;
+            }
+
+            sem_init(&rc_ind_sem, 0, 0);
+            defer({ sem_destroy(&rc_ind_sem); });
+
+            const char* env_target = getenv("XML5G_TARGET_RAN_UE_ID");
+            int exit_code = EXIT_FAILURE;
+
+            for (int i = 0; i < nodes.len; i++) {
+              e2_node_connected_xapp_t* n = &nodes.n[i];
+              if (n->id.type != ngran_gNB && n->id.type != ngran_gNB_CU && n->id.type != ngran_gNB_CUCP)
+                continue;
+
+              const size_t idx = find_ran_func_idx(n->rf, n->len_rf, SM_RC_ID);
+              if (idx == n->len_rf) {
+                printf("[XML5G] E2 node %d: no E2SM-RC\n", n->id.nb_id.nb_id);
+                continue;
+              }
+              const bool ctrl_ok = supports_release_ctrl(n->rf[idx].defn.rc.ctrl);
+              const bool report_ok = supports_on_demand_ue_ctx(n->rf[idx].defn.rc.report);
+              printf("[XML5G] E2 node %d: RRC Connection Release advertised=%s, On Demand UE context advertised=%s\n",
+                     n->id.nb_id.nb_id, ctrl_ok ? "yes" : "no", report_ok ? "yes" : "no");
+              if (!ctrl_ok || !report_ok)
+                continue;
+
+              // 1. List the connected UEs
+              rc_sub_data_t rc_sub = gen_rc_sub_on_demand();
+              const sm_ans_xapp_t sub_ans = report_sm_xapp_api(&n->id, SM_RC_ID, &rc_sub, sm_cb_rc);
+              free_rc_sub_data(&rc_sub);
+              if (sub_ans.success) {
+                struct timespec deadline;
+                clock_gettime(CLOCK_REALTIME, &deadline);
+                deadline.tv_sec += 5;
+                while (sem_timedwait(&rc_ind_sem, &deadline) == -1 && errno == EINTR)
+                  ;
+                rm_report_sm_xapp_api(sub_ans.u.handle);
+              } else {
+                printf("[XML5G] On Demand subscription rejected\n");
+                continue;
+              }
+
+              printf("[XML5G] connected UEs: %zu\n", ues.n);
+              const ue_id_e2sm_t* target = NULL;
+              for (size_t k = 0; k < ues.n; k++) {
+                const ue_id_e2sm_t* u = &ues.ue_id[k];
+                if (!has_ran_ue_id(u))
+                  continue;
+                printf("[XML5G] UE ran_ue_id=%" PRIu64 " amf_ue_ngap_id=%" PRIu64 "\n",
+                       *u->gnb.ran_ue_id, (uint64_t)u->gnb.amf_ue_ngap_id);
+                if (env_target != NULL) {
+                  if (*u->gnb.ran_ue_id == strtoull(env_target, NULL, 10))
+                    target = u;
+                } else if (target == NULL || *u->gnb.ran_ue_id < *target->gnb.ran_ue_id) {
+                  target = u;
+                }
+              }
+              if (target == NULL) {
+                printf("[XML5G] no target UE found\n");
+                continue;
+              }
+
+              // 2. Release it through E2SM-RC
+              rc_ctrl_req_data_t ctrl = gen_release_ctrl(target);
+              const int64_t t_send = now_us();
+              printf("[XML5G] CONTROL RRC Connection Release ran_ue_id=%" PRIu64 " t_ctrl_send_us=%" PRId64 "\n",
+                     *target->gnb.ran_ue_id, t_send);
+              fflush(stdout);
+              const sm_ans_xapp_t ans = control_sm_xapp_api(&n->id, SM_RC_ID, &ctrl);
+              const int64_t t_ack = now_us();
+              free_rc_ctrl_req_data(&ctrl);
+              printf("[XML5G] CONTROL result=%s t_ctrl_ack_us=%" PRId64 " rtt_us=%" PRId64 "\n",
+                     ans.success ? "ACK" : "FAILURE", t_ack, t_ack - t_send);
+              fflush(stdout);
+              if (ans.success)
+                exit_code = EXIT_SUCCESS;
+            }
+
+            for (size_t k = 0; k < ues.n; k++)
+              free_ue_id_e2sm(&ues.ue_id[k]);
+
+            while (try_stop_xapp_api() == false)
+              usleep(1000);
+
+            return exit_code;
+          }
+          XML5G_XAPP_EOF
+          cat > "$X/CMakeLists.txt" <<'XML5G_CMAKE_EOF'
+          # xML5G - UE release xApp (built inside FlexRIC, like the rc_handover example)
+          add_executable(xapp_rc_release
+            xapp_rc_release.c
+            ../../../../src/util/alg_ds/alg/defer.c
+            )
+
+          target_link_libraries(xapp_rc_release
+                                PUBLIC
+                                e42_xapp
+                                -pthread
+                                -lsctp
+                                -ldl
+                                )
+          XML5G_CMAKE_EOF
+          echo 'add_subdirectory(rc_release)' >> "$WORK/oai/openair2/E2AP/flexric/examples/xApp/c/CMakeLists.txt"
+      - name: 5. Compiler OAI (gNB, UE, agent E2) — environ 40 min
+        run: |
+
+          cd "$WORK/oai/cmake_targets"
+          ./build_oai -I > "$LOGS/04_oai_dependances.log" 2>&1 || { tail -50 "$LOGS/04_oai_dependances.log"; exit 1; }
+          ./build_oai -w SIMU --gNB --nrUE --build-e2 --cmake-opt -DE2AP_VERSION=E2AP_V3 --cmake-opt -DKPM_VERSION=KPM_V3_00 --ninja > "$LOGS/05_oai_compilation.log" 2>&1 || { tail -80 "$LOGS/05_oai_compilation.log"; exit 1; }
+          ls -la ran_build/build/nr-softmodem ran_build/build/nr-uesoftmodem
+          echo "oai_compile=ok" >> "$LOGS/09_etapes.txt"
+      - name: 6. Compiler et installer FlexRIC (RIC et xApps)
+        run: |
+
+          sudo apt-get install -y -q libpcre2-dev libsctp-dev > /dev/null
+          cd "$WORK/oai/openair2/E2AP/flexric" && mkdir -p build && cd build
+          cmake -GNinja -DE2AP_VERSION=E2AP_V3 -DKPM_VERSION=KPM_V3_00 -DCMAKE_BUILD_TYPE=Release .. > "$LOGS/06_flexric_cmake.log" 2>&1
+          ninja -j"$(nproc)" > "$LOGS/07_flexric_compilation.log" 2>&1 || { tail -60 "$LOGS/07_flexric_compilation.log"; exit 1; }
+          sudo ninja install > "$LOGS/08_flexric_installation.log" 2>&1
+          SM_DIR="$(dirname "$(find /usr/local -name librc_sm.so | head -1)")"
+          test -n "$SM_DIR" && echo "SM_DIR=$SM_DIR" >> "$GITHUB_ENV"
+          FR_CONF="$(find /usr/local/etc -name flexric.conf | head -1)"; FR_CONF="${FR_CONF:-$WORK/oai/openair2/E2AP/flexric/flexric.conf}"
+          echo "FR_CONF=$FR_CONF" >> "$GITHUB_ENV"
+          echo "modèles de service : $SM_DIR ; configuration : $FR_CONF"
+          ls examples/ric/nearRT-RIC examples/xApp/c/rc_release/xapp_rc_release examples/xApp/c/monitor/xapp_kpm_moni
+          echo "flexric_compile=ok" >> "$LOGS/09_etapes.txt"
+      - name: 7. Démarrer le cœur 5G
+        continue-on-error: true
+        run: |
+
+          cd "$WORK/oai/doc/tutorial_resources/oai-cn5g"
+          S="mysql oai-nrf oai-udr oai-udm oai-ausf oai-amf oai-smf oai-upf oai-ext-dn"
+          docker compose pull -q $S
+          docker compose up -d $S
+          for i in $(seq 1 60); do
+            a=$(docker inspect -f '{{.State.Health.Status}}' mysql 2>/dev/null || true)
+            b=$(docker inspect -f '{{.State.Health.Status}}' oai-ext-dn 2>/dev/null || true)
+            [ "$a" = healthy ] && [ "$b" = healthy ] && break
+            sleep 5
+          done
+          sleep 10
+          docker compose ps | tee "$LOGS/13_coeur_conteneurs.txt"
+          n=$(docker compose ps --status running -q | wc -l)
+          ip -4 addr show oai-cn5g | tee -a "$LOGS/13_coeur_conteneurs.txt"
+          [ "$n" -ge 9 ] && { echo "coeur=ok"; echo "coeur_detail=$n conteneurs actifs"; } >> "$LOGS/09_etapes.txt"
+      - name: 8. Démarrer le RIC puis le gNB
+        continue-on-error: true
+        run: |
+
+          FR="$WORK/oai/openair2/E2AP/flexric/build"
+          cd "$FR"
+          sudo setsid nohup stdbuf -oL -eL ./examples/ric/nearRT-RIC -c "$FR_CONF" -p "$SM_DIR/" > "$LOGS/10_ric.log" 2>&1 < /dev/null &
+          sleep 3
+          B="$WORK/oai/cmake_targets/ran_build/build"
+          CONF="$WORK/oai/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf"
+          cd "$B"
+          sudo setsid nohup stdbuf -oL -eL ./nr-softmodem -O "$CONF" '--gNBs.[0].min_rxtxtime' 6 --rfsim --e2_agent.sm_dir "$SM_DIR/" > "$LOGS/11_gnb.log" 2>&1 < /dev/null &
+          for i in $(seq 1 60); do
+            grep -q "Received NGSetupResponse from AMF" "$LOGS/11_gnb.log" && grep -q "E2 SETUP RESPONSE rx" "$LOGS/11_gnb.log" && break
+            sleep 2
+          done
+          grep -E "NGSetup|E2 SETUP|E2-AGENT" "$LOGS/11_gnb.log" | head -20
+          grep -E "E2 SETUP" "$LOGS/10_ric.log" | head -5
+      - name: 9. Démarrer deux UEs (espaces de noms séparés)
+        continue-on-error: true
+        run: |
+
+          B="$WORK/oai/cmake_targets/ran_build/build"
+          for k in 1 2; do
+            sudo bash "$WORK/oai/tools/scripts/multi-ue.sh" -c$k
+            cat > "$WORK/ue$k.conf" <<EOF
+          uicc0 = {
+          imsi = "00101000000000$k";
+          key = "fec86ba6eb707ed08905757b1bb44b8f";
+          opc= "C42449363BBAD02B66D16BC975D77CC1";
+          pdu_sessions = ({ dnn = "oai"; nssai_sst = 1; });
+          }
+          EOF
+            cd "$B"
+            sudo setsid nohup stdbuf -oL -eL ip netns exec ue$k ./nr-uesoftmodem -O "$WORK/ue$k.conf" -r 106 --numerology 1 --band 78 -C 3619200000 --rfsim '--rfsimulator.[0].serveraddr' "10.20$k.1.100" > "$LOGS/12_ue$k.log" 2>&1 < /dev/null &
+            ip_ue=""; itf=""
+            for i in $(seq 1 60); do
+              ligne=$(sudo ip netns exec ue$k ip -o -4 addr show 2>/dev/null | grep oaitun || true)
+              if [ -n "$ligne" ]; then itf=$(echo "$ligne" | awk '{print $2}'); ip_ue=$(echo "$ligne" | awk '{print $4}' | cut -d/ -f1); break; fi
+              sleep 3
+            done
+            echo "UE$k : interface ${itf:-aucune} adresse ${ip_ue:-aucune}"
+            echo "ue${k}_ip=${ip_ue:-aucune}" >> "$LOGS/09_etapes.txt"
+            echo "UE${k}_IF=${itf:-oaitun_ue1}" >> "$GITHUB_ENV"
+          done
+      - name: 10. Tester la connectivité des UEs
+        continue-on-error: true
+        run: |
+
+          for k in 1 2; do
+            itf_var="UE${k}_IF"; itf="${!itf_var}"
+            if sudo ip netns exec ue$k ping -c 5 -W 2 -I "$itf" 192.168.70.135 > "$LOGS/14_ping_ue$k.txt" 2>&1; then
+              echo "ping_ue$k=ok" >> "$LOGS/09_etapes.txt"
+            fi
+            tail -3 "$LOGS/14_ping_ue$k.txt"
+          done
+      - name: 11. Vérifier les mesures E2SM-KPM
+        continue-on-error: true
+        run: |
+
+          cd "$WORK/oai/openair2/E2AP/flexric/build"
+          XAPP_DURATION=15 timeout 60 stdbuf -oL -eL ./examples/xApp/c/monitor/xapp_kpm_moni -c "$FR_CONF" -p "$SM_DIR/" > "$LOGS/20_kpm.log" 2>&1 || true
+          tail -30 "$LOGS/20_kpm.log"
+      - name: 12. Tester la libération d'un UE par E2SM-RC
+        continue-on-error: true
+        run: |
+
+          sudo ip netns exec ue1 ping -D -O -i 0.2 -w 45 -I "$UE1_IF" 192.168.70.135 > "$LOGS/30_ping_ue1.txt" 2>&1 &
+          sudo ip netns exec ue2 ping -D -O -i 0.2 -w 45 -I "$UE2_IF" 192.168.70.135 > "$LOGS/30_ping_ue2.txt" 2>&1 &
+          sleep 10
+          cd "$WORK/oai/openair2/E2AP/flexric/build"
+          timeout 60 stdbuf -oL -eL ./examples/xApp/c/rc_release/xapp_rc_release -c "$FR_CONF" -p "$SM_DIR/" > "$LOGS/31_xapp_release.log" 2>&1 || true
+          cat "$LOGS/31_xapp_release.log" | grep XML5G
+          sleep 35
+          wait || true
+          grep -E "XML5G|Send RRC Release" "$LOGS/11_gnb.log" | head -10
+      - name: 13. Bilan
+        if: always()
+        run: |
+          cd "$WORK/oai/doc/tutorial_resources/oai-cn5g" 2>/dev/null && for c in oai-amf oai-smf oai-upf; do docker logs "$c" > "$LOGS/40_$c.log" 2>&1 || true; done
+          cp "$WORK"/oai/cmake_targets/log/*.txt "$LOGS/" 2>/dev/null || true
+          sudo chmod -R a+r "$LOGS" || true
+          cat > "$WORK/bilan.py" <<'XML5G_BILAN_EOF'
+          #!/usr/bin/env python3
+          # xML5G phase 1 : bilan lisible des journaux (tableau dans le résumé GitHub)
+          import os, re, glob, json
+
+          L = os.environ.get("LOGS", "logs")
+          def lire(nom):
+              p = os.path.join(L, nom)
+              return open(p, errors="replace").read() if os.path.exists(p) else ""
+
+          gnb, ric, xapp, kpm = lire("11_gnb.log"), lire("10_ric.log"), lire("31_xapp_release.log"), lire("20_kpm.log")
+          etat = {}
+          for ligne in lire("09_etapes.txt").splitlines():
+              if "=" in ligne:
+                  k, v = ligne.split("=", 1); etat[k.strip()] = v.strip()
+
+          def ping(nom):
+              """(horodatage, reçu) pour chaque ligne de ping -D -O"""
+              out = []
+              for l in lire(nom).splitlines():
+                  m = re.match(r"\[(\d+\.\d+)\]\s+(.*)", l)
+                  if not m: continue
+                  t, reste = float(m.group(1)), m.group(2)
+                  if "bytes from" in reste: out.append((t, True))
+                  elif "no answer yet" in reste: out.append((t, False))
+              return out
+
+          def entier(motif, texte):
+              m = re.search(motif, texte)
+              return int(m.group(1)) if m else None
+
+          t_send = entier(r"t_ctrl_send_us=(\d+)", xapp)
+          t_ack  = entier(r"t_ctrl_ack_us=(\d+)", xapp)
+          t_rx   = entier(r"t_ctrl_rx_us=(\d+)", gnb)
+          t_rel  = entier(r"t_release_req_us=(\d+)", gnb)
+
+          p1, p2 = ping("30_ping_ue1.txt"), ping("30_ping_ue2.txt")
+          res = {}
+          if t_send and p1:
+              ts = t_send / 1e6
+              avant = [t for t, ok in p1 if ok and t <= ts]
+              apres = [t for t, ok in p1 if ok and t > ts]
+              derniere = max([t for t in apres if t - ts < 5] or avant or [None]) if (apres or avant) else None
+              # reprise : réponses au moins 3 s après l'envoi (reconnexion de l'UE)
+              reprise = [t for t in apres if t - ts >= 3]
+              res["ue1_reponses_avant"] = len(avant)
+              res["ue1_coupure_ms"] = round((derniere - ts) * 1000) if derniere else None
+              res["ue1_reprise_s"] = round(reprise[0] - ts, 1) if reprise else None
+          if t_send and p2:
+              ts = t_send / 1e6
+              fen = [ok for t, ok in p2 if ts <= t <= ts + 20]
+              res["ue2_taux_reponse"] = round(100 * sum(fen) / len(fen), 1) if fen else None
+
+          nb_ues = entier(r"connected UEs: (\d+)", xapp)
+          lignes = [
+           ("OAI compilé (gNB, UE, agent E2 modifié)", etat.get("oai_compile") == "ok", ""),
+           ("FlexRIC compilé (RIC et xApp de libération)", etat.get("flexric_compile") == "ok", ""),
+           ("Cœur 5G démarré", etat.get("coeur") == "ok", etat.get("coeur_detail", "")),
+           ("gNB connecté au cœur (NG Setup)", "Received NGSetupResponse from AMF" in gnb, ""),
+           ("gNB connecté au RIC (E2 Setup)", "E2 SETUP RESPONSE rx" in gnb and "E2 SETUP-REQUEST rx" in ric, ""),
+           ("UE1 connecté (adresse IP)", etat.get("ue1_ip", "") not in ("", "aucune"), etat.get("ue1_ip", "")),
+           ("UE2 connecté (adresse IP)", etat.get("ue2_ip", "") not in ("", "aucune"), etat.get("ue2_ip", "")),
+           ("UE1 et UE2 joignent Internet (ping)", etat.get("ping_ue1") == "ok" and etat.get("ping_ue2") == "ok", ""),
+           ("Mesures E2SM-KPM reçues par UE", bool(re.search(r"ran_ue_id|DRB\.UEThp", kpm)), ""),
+           ("Commande de libération annoncée par le gNB", "RRC Connection Release advertised=yes" in xapp, ""),
+           ("UEs vus par l'xApp", (nb_ues or 0) >= 2, f"{nb_ues} UE" if nb_ues is not None else ""),
+           ("Commande E2SM-RC acceptée (ACK)", "CONTROL result=ACK" in xapp,
+            f"aller-retour {(t_ack - t_send)/1000:.1f} ms" if t_send and t_ack else ""),
+           ("Libération exécutée par le gNB", "[XML5G] E2SM-RC RRC Connection Release" in gnb,
+            f"réception {(t_rx - t_send)/1000:.1f} ms après l'envoi" if t_send and t_rx else ""),
+           ("RRC Release envoyé à l'UE", "Send RRC Release" in gnb, ""),
+           ("Trafic de l'UE1 coupé", res.get("ue1_coupure_ms") is not None and res.get("ue1_reponses_avant", 0) > 0,
+            f"dernière réponse {res.get('ue1_coupure_ms')} ms après l'envoi" if res.get("ue1_coupure_ms") is not None else ""),
+           ("UE2 non affecté", (res.get("ue2_taux_reponse") or 0) >= 90,
+            f"{res.get('ue2_taux_reponse')} % de réponses" if res.get("ue2_taux_reponse") is not None else ""),
+          ]
+          md = ["## xML5G — phase 1 : bilan", "", "| Vérification | Résultat | Détail |", "|---|---|---|"]
+          for nom, ok, det in lignes:
+              md.append(f"| {nom} | {'✅' if ok else '❌'} | {det} |")
+          rep = res.get("ue1_reprise_s")
+          md += ["", f"Reconnexion de l'UE1 après libération : {'oui, après ' + str(rep) + ' s' if rep else 'non observée pendant le test'}.",
+                 "", f"**{sum(ok for _, ok, _ in lignes)} vérifications réussies sur {len(lignes)}.**"]
+          texte = "\n".join(md)
+          print(texte)
+          open(os.path.join(L, "99_bilan.md"), "w").write(texte + "\n")
+          json.dump(dict(res, t_ctrl_send_us=t_send, t_ctrl_ack_us=t_ack, t_ctrl_rx_us=t_rx, t_release_req_us=t_rel,
+                         etapes=etat), open(os.path.join(L, "99_mesures.json"), "w"), indent=2)
+          s = os.environ.get("GITHUB_STEP_SUMMARY")
+          if s:
+              open(s, "a").write(texte + "\n")
+          XML5G_BILAN_EOF
+          python3 "$WORK/bilan.py"
+
+      - name: 14. Journaux à télécharger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xml5g-phase1-journaux
+          path: /home/runner/xml5g-journaux
+          if-no-files-found: warn
