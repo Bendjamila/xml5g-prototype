@@ -1408,6 +1408,9 @@ jobs:
       - name: 7. Démarrer le cœur 5G, le RIC, le gNB et 2 UEs
         continue-on-error: true
         run: |
+          # GitHub lance bash avec -e -o pipefail : une recherche d'adresse encore vide
+          # (grep sans résultat) arrêtait toute l'étape. On gère les erreurs nous-mêmes.
+          set +e +o pipefail
 
           cd "$WORK/oai/doc/tutorial_resources/oai-cn5g"
           S="mysql oai-nrf oai-udr oai-udm oai-ausf oai-amf oai-smf oai-upf oai-ext-dn"
@@ -1452,9 +1455,16 @@ jobs:
           done
           echo "UES=$UES" >> "$GITHUB_ENV"
           echo "les deux UEs : $UES"
+          n_ue=$(echo "$UES" | tr ',' '\n' | grep -c . )
+          echo "nb_ue=$n_ue" >> "$LOGS/09_etapes.txt"
+          [ "$n_ue" -eq 2 ] || echo "::error::seulement $n_ue UE(s) connecté(s) sur 2 : la suite ne peut pas fonctionner"
       - name: 8. Collecte du trafic d'entraînement (2 sessions)
         continue-on-error: true
         run: |
+          # GitHub lance bash avec -e -o pipefail : une recherche d'adresse encore vide
+          # (grep sans résultat) arrêtait toute l'étape. On gère les erreurs nous-mêmes.
+          set +e +o pipefail
+          [ -n "$UES" ] || echo "::error::variable UES vide : aucun UE n'a d'adresse (voir l'étape 7)"
 
           cd "$WORK/py"
           for S in A B; do
@@ -1462,19 +1472,29 @@ jobs:
             sudo setsid nohup stdbuf -oL python3 ids_xml5g.py --mode collect --iface oai-cn5g --upf 192.168.70.134 --bin 0.2 --duration 130 --out "$LOGS/50_train_$S.csv" > "$LOGS/50_collect_$S.log" 2>&1 < /dev/null &
             IDS_PID=$!
             sleep 3
-            sudo python3 scenario.py --ues "$UES" --attacker $ATT --attack $([ "$S" = A ] && echo syn || echo udp) --warmup 10 --attack-start 20 --attack-dur 60 --total 120 --events "$LOGS/50_ev_$S.jsonl"
+            sudo python3 scenario.py --ues "$UES" --attacker $ATT --attack $([ "$S" = A ] && echo syn || echo udp) --warmup 10 --attack-start 20 --attack-dur 60 --total 120 --events "$LOGS/50_ev_$S.jsonl" 2>&1 | tee "$LOGS/50_scenario_$S.log"
             wait $IDS_PID 2>/dev/null || true
-            echo "session $S : $(wc -l < "$LOGS/50_train_$S.csv") lignes"
+            n_l=$(wc -l < "$LOGS/50_train_$S.csv")
+            echo "session $S : $n_l lignes"
+            [ "$n_l" -gt 1 ] || echo "::error::session $S : aucun relevé collecté (voir 50_collect_$S.log et 50_scenario_$S.log)"
           done
       - name: 9. Entraîner le détecteur (évaluation croisée)
         continue-on-error: true
         run: |
+          # GitHub lance bash avec -e -o pipefail : une recherche d'adresse encore vide
+          # (grep sans résultat) arrêtait toute l'étape. On gère les erreurs nous-mêmes.
+          set +e +o pipefail
 
           cd "$WORK/py"
-          python3 train_xml5g.py --a "$LOGS/50_train_A.csv" "$LOGS/50_ev_A.jsonl" --b "$LOGS/50_train_B.csv" "$LOGS/50_ev_B.jsonl" --bin 0.2 --model "$WORK/model.joblib" --metrics "$LOGS/50_train_metrics.json"
+          python3 train_xml5g.py --a "$LOGS/50_train_A.csv" "$LOGS/50_ev_A.jsonl" --b "$LOGS/50_train_B.csv" "$LOGS/50_ev_B.jsonl" --bin 0.2 --model "$WORK/model.joblib" --metrics "$LOGS/50_train_metrics.json" 2>&1 | tee "$LOGS/50_train.log"
+          [ -f "$WORK/model.joblib" ] || echo "::error::détecteur non entraîné : voir 50_train.log"
       - name: 10. Boucle complète, pour chaque politique
         continue-on-error: true
         run: |
+          # GitHub lance bash avec -e -o pipefail : une recherche d'adresse encore vide
+          # (grep sans résultat) arrêtait toute l'étape. On gère les erreurs nous-mêmes.
+          set +e +o pipefail
+          [ -f "$WORK/model.joblib" ] || echo "::error::pas de modèle : la boucle tournera sans détecteur (voir l'étape 9)"
 
           cd "$WORK/py"
           B="$WORK/oai/cmake_targets/ran_build/build"
@@ -1488,7 +1508,7 @@ jobs:
             sudo -E setsid nohup stdbuf -oL python3 ids_xml5g.py --mode detect --iface oai-cn5g --upf 192.168.70.134 --bin 0.2 --duration 70 --model "$WORK/model.joblib" --xapp 127.0.0.1:9999 --out "$LOGS/61_ids_$POL.log" --summary "$LOGS/61_ids_${POL}_summary.json" > "$LOGS/61_ids_${POL}_run.log" 2>&1 < /dev/null &
             IDSPID=$!
             sleep 5
-            sudo python3 scenario.py --ues "$UES" --attacker $ATT --attack syn --warmup 5 --attack-start 10 --attack-dur 40 --total 55 --events "$LOGS/62_ev_$POL.jsonl"
+            sudo python3 scenario.py --ues "$UES" --attacker $ATT --attack syn --warmup 5 --attack-start 10 --attack-dur 40 --total 55 --events "$LOGS/62_ev_$POL.jsonl" 2>&1 | tee "$LOGS/62_scenario_$POL.log"
             wait $IDSPID 2>/dev/null || true
             sleep 3; sudo kill $XPID 2>/dev/null || true; sleep 2
             # l'UE libéré ne se reconnecte pas seul : on le relance pour la politique suivante
