@@ -1236,11 +1236,14 @@ jobs:
           """
           import argparse, json, os, subprocess, time, signal
 
-          def sh(ns, cmd, bg=False):
+          def sh(ns, cmd, bg=False, err=None):
+              # les erreurs sont conservées dans un fichier : sans elles, une attaque qui
+              # s'arrête au bout de 2 s ne laisse aucune trace
               full = ["sudo", "ip", "netns", "exec", ns, "bash", "-lc", cmd]
+              e = open(err, "w") if err else subprocess.DEVNULL
               if bg:
-                  return subprocess.Popen(full, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-              return subprocess.run(full, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  return subprocess.Popen(full, stdout=subprocess.DEVNULL, stderr=e)
+              return subprocess.run(full, stdout=subprocess.DEVNULL, stderr=e)
 
           def main():
               ap = argparse.ArgumentParser()
@@ -1258,8 +1261,12 @@ jobs:
               t0 = time.time()
               bg = []
               # trafic bénin de fond, montant, sur tous les UEs
+              base = os.path.splitext(a.events)[0]
               for ns in ues:
-                  bg.append(sh(ns, f"iperf3 -c {a.dn} -t {int(a.total)} -b 5M -u", bg=True))
+                  # iperf3 ; si le serveur est absent, repli sur un ping régulier
+                  bg.append(sh(ns, f"iperf3 -c {a.dn} -t {int(a.total)} -b 5M -u || "
+                                   f"ping -q -i 0.02 -s 1200 -w {int(a.total)} {a.dn}",
+                               bg=True, err=f"{base}_benin_{ns}.err"))
               time.sleep(max(0, a.attack_start - (time.time() - t0)))
               atk_ns = a.attacker
               atk_ip = ues[atk_ns]
@@ -1268,9 +1275,12 @@ jobs:
                   cmd = f"timeout {a.attack_dur} hping3 --flood -S -p 80 {a.dn}"
               else:
                   cmd = f"timeout {a.attack_dur} hping3 --flood --udp -p 5555 {a.dn}"
-              p = sh(atk_ns, cmd, bg=True)
+              p = sh(atk_ns, cmd, bg=True, err=f"{base}_attaque.err")
               p.wait()
               end = time.time()
+              if end - start < 0.5 * a.attack_dur:
+                  print(f"ATTENTION : l'attaque a duré {end - start:.1f} s au lieu de {a.attack_dur:.0f} s "
+                        f"(voir {base}_attaque.err)")
               time.sleep(max(0, a.total - (time.time() - t0)))
               for q in bg:
                   try: q.terminate()
@@ -1418,6 +1428,11 @@ jobs:
           for i in $(seq 1 60); do
             [ "$(docker inspect -f '{{.State.Health.Status}}' oai-ext-dn 2>/dev/null)" = healthy ] && break; sleep 5; done
           sleep 10; docker compose ps | tee "$LOGS/13_coeur.txt"
+          # serveur iperf3 dans le réseau de données (le trafic bénin des UEs en a besoin)
+          docker exec -d oai-ext-dn iperf3 -s > /dev/null 2>&1
+          sleep 1
+          if docker exec oai-ext-dn pgrep iperf3 > /dev/null 2>&1; then echo "iperf3_dn=ok" >> "$LOGS/09_etapes.txt"
+          else echo "iperf3_dn=absent" >> "$LOGS/09_etapes.txt"; echo "::warning::iperf3 absent du réseau de données : trafic bénin par ping"; fi
           FR="$WORK/oai/openair2/E2AP/flexric/build"
           sudo setsid nohup stdbuf -oL -eL "$FR/examples/ric/nearRT-RIC" -c "$FR_CONF" -p "$SM_DIR/" > "$LOGS/10_ric.log" 2>&1 < /dev/null &
           sleep 3
@@ -1450,6 +1465,18 @@ jobs:
               sudo pkill -f "ue$k.conf" || true; sleep 15
             done
             echo "UE$k adresse ${ip_ue:-aucune}"; echo "ue${k}_ip=${ip_ue:-aucune}" >> "$LOGS/09_etapes.txt"
+            if [ -n "$ip_ue" ]; then
+              # sans cette route, le trafic de l'UE vers le réseau de données n'a aucun chemin
+              # (« Network is unreachable ») : ni trafic bénin, ni attaque, rien dans le tunnel GTP-U
+              tun=$(sudo ip netns exec ue$k ip -o -4 addr show | awk '/oaitun/{print $2; exit}')
+              sudo ip netns exec ue$k ip route replace 192.168.70.0/24 dev "$tun"
+              sudo ip netns exec ue$k ip route | sed "s/^/ue$k route: /" >> "$LOGS/09_routes.txt"
+              if sudo ip netns exec ue$k ping -c 3 -W 3 192.168.70.135 > "$LOGS/09_ping_ue$k.txt" 2>&1; then
+                echo "ue${k}_ping=ok" >> "$LOGS/09_etapes.txt"
+              else
+                echo "ue${k}_ping=echec" >> "$LOGS/09_etapes.txt"; echo "::error::UE$k ne joint pas le réseau de données (voir 09_ping_ue$k.txt)"
+              fi
+            fi
             [ -n "$ip_ue" ] && UES="${UES:+$UES,}ue$k:$ip_ue"
             sleep 20
           done
