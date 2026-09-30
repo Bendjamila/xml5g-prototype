@@ -6,13 +6,13 @@
 # boucle fermée pour quatre politiques (none, immediate, slice, xml5g) et
 # compare leur effet. Bilan sur la page de l'exécution ; journaux en Artifacts.
 
-name: xML5G phase 2
+name: xML5G campagne finale
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - '.github/workflows/phase2.yml'
+      - '.github/workflows/phaseF2.yml'
 
 permissions:
   contents: read
