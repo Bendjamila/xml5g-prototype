@@ -1,5 +1,6 @@
-# xML5G — phase 2, CAMPAGNE FINALE : boucle complète détection -> décision -> action,
-# 5 répétitions de chaque politique, qualité de service de l'UE bénin, CPU et mémoire.
+# xML5G — phase 2, CAMPAGNE FINALE CORRIGÉE : boucle complète détection -> décision -> action,
+# 5 essais VALIDES par politique (essais sans UE connecté remplacés), trafic bénin à 0,5 Mbit/s
+# (sous la capacité du lien simulé), débit bénin mesuré à l'UPF, CPU et mémoire.
 # Reconstruit la plateforme (comme en phase 1), entraîne le détecteur retenu par
 # l'étude sur les jeux publics (XGBoost, seuil sous budget de fausses alarmes) sur le
 # trafic de la plateforme (2 sessions, évaluation croisée), puis exécute la
@@ -1353,6 +1354,9 @@ jobs:
               ap.add_argument("--ues", required=True, help="ex. ue1:10.0.0.2,ue2:10.0.0.3")
               ap.add_argument("--attacks", required=True, help="ex. ue1:syn:20:30,ue2:udp:70:30")
               ap.add_argument("--total", type=float, default=60)
+              # 0,5 Mbit/s : sous la capacité montante du lien radio simulé (0,7 à 3,4 Mbit/s mesurés),
+              # pour que l'UE bénin ne sature pas son propre lien et que son RTT de base reste faible
+              ap.add_argument("--benign-rate", default="0.5M")
               ap.add_argument("--events", required=True)
               a = ap.parse_args()
               ues = dict(u.split(":") for u in a.ues.split(",") if ":" in u)
@@ -1369,7 +1373,7 @@ jobs:
                   # pour que deux UEs ne se disputent pas un seul serveur (« server is busy »).
                   # Repli sur un ping régulier si le serveur ne répond pas.
                   port = 5200 + int(ns[2:]) if ns[2:].isdigit() else 5201
-                  bg.append(sh(ns, f"iperf3 -c {a.dn} -p {port} -t {int(a.total)} -b 5M -u || "
+                  bg.append(sh(ns, f"iperf3 -c {a.dn} -p {port} -t {int(a.total)} -b {a.benign_rate} -u || "
                                    f"ping -q -i 0.02 -s 1200 -w {int(a.total)} {a.dn}",
                                bg=True, err=f"{base}_benin_{ns}.err"))
                   # Sonde de RTT (qualité de service) : un ping horodaté toutes les 200 ms, par UE.
@@ -1463,6 +1467,22 @@ jobs:
                   except Exception:
                       pass
 
+          # validité des essais : écrite par le workflow (attaquant et UE bénin en service, attaque lancée)
+          VALIDITE = {}
+          for l in lire("63_validite.txt").splitlines():
+              f = l.split()
+              if len(f) >= 2: VALIDITE[f[0]] = (f[1] == "valide", " ".join(f[2:]))
+          UES_RUN = {}
+          for l in lire("63_ues_par_politique.txt").splitlines():
+              run, _, v = l.partition(" : ")
+              UES_RUN[run.strip()] = dict(x.split(":") for x in v.strip().split(",") if ":" in x)
+          def upf_pps(ip, t0, a, b):
+              """paquets montants par seconde de l'UE à l'UPF, en moyenne sur [t0+a, t0+b) (secondes sans paquet = 0)."""
+              ser = UPF.get(ip, {})
+              if not ser or b <= a: return None
+              ks = range(int(t0 + a), int(t0 + b))
+              return st.mean(ser.get(k, 0) for k in ks) if len(ks) else None
+
           RE_REL = re.compile(r"RELEASE ran_ue_id=(\d+) policy=\S+ t_first_alarm_rx_us=(\d+) t_decision_us=(\d+) "
                               r"t_ctrl_send_us=(\d+) t_ctrl_ack_us=(\d+) result=(\w+)")
           RE_SUM = re.compile(r"SUMMARY ran_ue_id=(\d+) verdicts=(\d+) alarms=(\d+) released=(\d)")
@@ -1537,6 +1557,7 @@ jobs:
                        regle_sur_attaquant=0, regle_sur_benins=0,
                        det_par_verdict=None, fp_par_verdict=None, n_verdicts_benins=0,
                        rtt_benin_avant_ms=None, rtt_benin_attaque_ms=None, rtt_benin_apres_ms=None, rep_benin_attaque=None,
+                       pps_benin_avant=None, pps_benin_attaque=None, pps_benin_apres=None, ratio_pps_benin=None,
                        debit_benin_avant=None, debit_benin_attaque=None, debit_benin_apres=None, perte_benin_attaque=None)
               if not e: return o
               t0 = e["start"]; fin = e["end"] - t0
@@ -1584,6 +1605,13 @@ jobs:
               o["rtt_benin_avant_ms"], _ = rtt(f"62_ev_{R}_rtt_{ns_b}.txt", t0, -9, 0)
               o["rtt_benin_attaque_ms"], o["rep_benin_attaque"] = rtt(f"62_ev_{R}_rtt_{ns_b}.txt", t0, 0, fin_att)
               o["rtt_benin_apres_ms"], _ = rtt(f"62_ev_{R}_rtt_{ns_b}.txt", t0, fin_att, fin_att + 15)
+              ip_b = UES_RUN.get(R, {}).get(ns_b)
+              if ip_b:
+                  o["pps_benin_avant"] = upf_pps(ip_b, t0, -9, 0)
+                  o["pps_benin_attaque"] = upf_pps(ip_b, t0, 0, fin_att)
+                  o["pps_benin_apres"] = upf_pps(ip_b, t0, fin_att, fin_att + 15)
+                  if o["pps_benin_avant"]:
+                      o["ratio_pps_benin"] = (o["pps_benin_attaque"] or 0) / o["pps_benin_avant"]
               o["debit_benin_avant"], _ = iperf(f"64_iperf_{R}_p{port_b}.json", t0, -9, 0)
               o["debit_benin_attaque"], o["perte_benin_attaque"] = iperf(f"64_iperf_{R}_p{port_b}.json", t0, 0, fin_att)
               o["debit_benin_apres"], _ = iperf(f"64_iperf_{R}_p{port_b}.json", t0, fin_att, fin_att + 15)
@@ -1596,14 +1624,23 @@ jobs:
 
           RUNS = []
           reps = sorted({int(m) for m in re.findall(r"60_xapp_\w+?_r(\d+)\.log", " ".join(os.listdir(L)))}) if os.path.isdir(L) else []
+          TOUS = []
           for r in reps:
               for p in POLS:
                   o = run(p, r)
-                  if o: RUNS.append(o)
-          if RUNS:
-              cles = sorted({k for o in RUNS for k in o}, key=lambda k: (k not in RUNS[0], k))
+                  if o:
+                      R_ = f"{p}_r{r}"
+                      if VALIDITE:
+                          o["valide"] = VALIDITE.get(R_, (False, "absent"))[0]
+                      else:      # anciennes campagnes : valide si l'attaquant et l'UE bénin étaient en service
+                          o["valide"] = all(k in UES_RUN.get(R_, {}) for k in ("ue1", "ue2"))
+                      TOUS.append(o)
+          RUNS = [o for o in TOUS if o["valide"]]
+          if TOUS:
+              cles = sorted({k for o in TOUS for k in o}, key=lambda k: (k not in TOUS[0], k))
               with open(os.path.join(L, "99_runs.csv"), "w", newline="") as f:
-                  w = csv.DictWriter(f, fieldnames=cles); w.writeheader(); [w.writerow(o) for o in RUNS]
+                  w = csv.DictWriter(f, fieldnames=cles + (["valide"] if "valide" not in cles else []))
+                  w.writeheader(); [w.writerow(o) for o in TOUS]
 
           def col(p, k): return [o.get(k) for o in RUNS if o["politique"] == p]
 
@@ -1619,9 +1656,27 @@ jobs:
                       md.append(f"- {k.replace('_', ' ')} : détection {m['detection']*100:.1f} %, FPR {(m['fpr'] or 0)*100:.2f} %, F1 {m['f1']:.3f}")
           md.append("")
 
+          # ---------- essais et validité ----------
+          md += ["### Essais et validité", "",
+                 "Un essai est **valide** si l'UE attaquant et l'UE bénin étaient en service et si l'attaque a été lancée ;",
+                 "seuls les essais valides entrent dans les statistiques.", "",
+                 "| Politique | Essais | Valides | Écartés (raison) |", "|---|---|---|---|"]
+          for p in POLS:
+              if VALIDITE:     # campagne avec fichier de validité : y figurent aussi les essais sans journaux
+                  es = [(k, v) for k, v in VALIDITE.items() if k.rsplit("_r", 1)[0] == p]
+              else:
+                  es = [(f"{p}_r{o['rep']}", (o["valide"], "UE attaquant ou bénin absent")) for o in TOUS if o["politique"] == p]
+              if not es: continue
+              raisons = {}
+              for _, (ok, rs) in es:
+                  if not ok: raisons[rs or "?"] = raisons.get(rs or "?", 0) + 1
+              md.append(f"| {NOMS[p]} | {len(es)} | {sum(ok for _, (ok, _) in es)} | "
+                        + (", ".join(f"{k} : {v}" for k, v in raisons.items()) or "—") + " |")
+          md.append("")
+
           # ---------- tableau par politique, moyennes et IC 95 % ----------
           STATS = []
-          md += [f"### Boucle fermée : {len(reps)} répétitions par politique (moyenne ± écart-type [IC 95 %])", "",
+          md += ["### Boucle fermée, essais valides (moyenne ± écart-type [IC 95 %])", "",
                  "| Politique | Attaquant coupé | UE bénins coupés | 1re alarme → commande (ms) | Décision → ACK E2 (ms) | Début → coupure (s) | Début → flood à l'UPF (s) | Début → 1re alarme (s) |",
                  "|---|---|---|---|---|---|---|---|"]
           for p in POLS:
@@ -1649,18 +1704,19 @@ jobs:
 
           # ---------- qualité de service de l'UE bénin ----------
           md += ["### Qualité de service de l'UE bénin pendant l'attaque (moyenne sur les répétitions)", "",
-                 "| Politique | Débit reçu avant (Mbit/s) | Débit reçu pendant | Débit reçu après | Pertes pendant (%) | RTT médian avant (ms) | RTT pendant | RTT après |",
+                 "Débit de l'UE bénin mesuré **à l'UPF** (paquets montants reçus par seconde) et RTT de sa sonde ping.", "",
+                 "| Politique | Paquets/s à l'UPF avant | pendant | après | Rapport pendant/avant | RTT médian avant (ms) | RTT pendant | RTT après |",
                  "|---|---|---|---|---|---|---|---|"]
           for p in POLS:
               if not col(p, "rep"): continue
               g = lambda c, d=2: fmt(moy_ic(col(p, c))[0], d=d)
-              md.append(f"| {NOMS[p]} | {g('debit_benin_avant')} | {g('debit_benin_attaque')} | {g('debit_benin_apres')} | "
-                        f"{g('perte_benin_attaque', 1)} | {g('rtt_benin_avant_ms', 1)} | {g('rtt_benin_attaque_ms', 1)} | {g('rtt_benin_apres_ms', 1)} |")
+              md.append(f"| {NOMS[p]} | {g('pps_benin_avant', 1)} | {g('pps_benin_attaque', 1)} | {g('pps_benin_apres', 1)} | "
+                        f"{g('ratio_pps_benin', 2)} | {g('rtt_benin_avant_ms', 1)} | {g('rtt_benin_attaque_ms', 1)} | {g('rtt_benin_apres_ms', 1)} |")
           md.append("")
 
           # ---------- tests statistiques : xML5G contre chaque alternative ----------
           md += ["### Tests statistiques (xML5G contre chaque alternative)", "",
-                 "| Comparaison | UE bénins coupés (Fisher exact) | Débit bénin pendant l'attaque (Mann-Whitney) | RTT bénin pendant l'attaque (Mann-Whitney) |",
+                 "| Comparaison | UE bénins coupés (Fisher exact) | Débit bénin pendant/avant à l'UPF (Mann-Whitney) | RTT bénin pendant l'attaque (Mann-Whitney) |",
                  "|---|---|---|---|"]
           TESTS = []
           try:
@@ -1675,14 +1731,14 @@ jobs:
                       a_ = [v for v in col("xml5g", c) if v is not None]; b_ = [v for v in col(p, c) if v is not None]
                       if len(a_) < 2 or len(b_) < 2: return None
                       return mannwhitneyu(a_, b_, alternative="two-sided").pvalue
-                  pd_, pr_ = mw("debit_benin_attaque"), mw("rtt_benin_attaque_ms")
+                  pd_, pr_ = mw("ratio_pps_benin"), mw("rtt_benin_attaque_ms")
                   TESTS.append(dict(comparaison=f"xml5g_vs_{p}", fisher_benins=pf, mw_debit=pd_, mw_rtt=pr_))
                   md.append(f"| xML5G vs {NOMS[p]} | p = {pf:.3f} ({bx}/{nx} vs {bp}/{n}) | "
                             f"{'p = %.3f' % pd_ if pd_ is not None else '—'} | {'p = %.3f' % pr_ if pr_ is not None else '—'} |")
           except Exception as ex:
               md.append(f"| (tests impossibles : {ex}) | | | |")
-          md += ["", f"Avec {len(reps)} répétitions par groupe, la plus petite p-valeur possible du test de Mann-Whitney est "
-                 f"{2 / math.comb(2 * max(len(reps), 1), max(len(reps), 1)):.4f}.", ""]
+          md += ["", f"Avec 5 essais valides par groupe, la plus petite p-valeur possible du test de Mann-Whitney est "
+                 f"{2 / math.comb(10, 5):.4f}, et celle du test de Fisher pour 0/5 contre 5/5 est {2 / math.comb(10, 5):.4f}.", ""]
 
           # ---------- ressources ----------
           md += ["### Ressources (moyenne des répétitions)", "",
@@ -1723,8 +1779,8 @@ jobs:
             all(isinstance(iv.get(k), list) and iv[k][0] > 0 and iv[k][1] > 0 for k in ("A", "B"))),
            ("Détecteur entraîné et évalué en croisé",
             any(isinstance(train.get(k), dict) and train[k].get("detection") is not None for k in ("A_vers_B", "B_vers_A"))),
-           (f"Toutes les exécutions ont tourné ({len(RUNS)} sur {4 * len(reps)}) et reçu des verdicts",
-            bool(RUNS) and len(RUNS) == 4 * len(reps) and all(o["verdicts"] > 0 for o in RUNS)),
+           ("Au moins 5 essais valides par politique, tous avec des verdicts",
+            all(len(col(p, "rep")) >= 5 for p in POLS) and all(o["verdicts"] > 0 for o in RUNS)),
            ("Verdicts toujours associés à un UE (aucun verdict orphelin)",
             bool(RUNS) and all(o["non_associes"] == 0 for o in RUNS)),
            (f"xML5G coupe l'attaquant dans au moins 80 % des répétitions ({sum(col('xml5g', 'attaquant_libere'))}/{nx})",
@@ -1733,9 +1789,9 @@ jobs:
             nx > 0 and sum(col("xml5g", "attaquant_libere")) > 0 and sum(col("xml5g", "benins_liberes")) == 0),
            ("Sans action : la règle se déclenche sur l'attaquant, jamais sur un UE bénin",
             nn > 0 and sum(col("none", "regle_sur_attaquant")) >= 0.8 * nn and sum(col("none", "regle_sur_benins")) == 0),
-           ("Qualité de service de l'UE bénin mesurée (RTT) dans toutes les répétitions",
-            bool(RUNS) and all(o["rtt_benin_avant_ms"] is not None for o in RUNS)),
-           ("CPU et mémoire de l'xApp et du détecteur mesurés dans toutes les répétitions",
+           ("Qualité de service de l'UE bénin mesurée (RTT et débit à l'UPF) dans tous les essais valides",
+            bool(RUNS) and all(o["rtt_benin_avant_ms"] is not None and o["pps_benin_avant"] is not None for o in RUNS)),
+           ("CPU et mémoire de l'xApp et du détecteur mesurés dans tous les essais valides",
             bool(RUNS) and all(o.get("cpu_xapp_pct") is not None and o.get("cpu_detecteur_pct") is not None for o in RUNS)),
           ]
           md += ["### Vérifications", "", "| Vérification | Résultat |", "|---|---|"]
@@ -1929,23 +1985,40 @@ jobs:
             echo ""
           }
 
-          NREP=5
-          # Ordre alterné (xml5g, immediate, slice, none) à chaque répétition : une dérive lente
-          # de la machine se répartit sur toutes les politiques au lieu d'en pénaliser une.
-          for REP in $(seq 1 $NREP); do
+          # CAMPAGNE CORRIGÉE : on vise 5 essais VALIDES par politique. Un essai est valide si
+          # l'UE attaquant ET l'UE bénin sont en service et si l'attaque a bien été lancée.
+          # Si un UE ne se connecte pas, la plateforme est redémarrée (3 tentatives) ; un essai
+          # resté invalide est noté et remplacé par un essai supplémentaire.
+          NVALIDE=5; MAX_ESSAIS=8
+          DEBUT=$(date +%s); BUDGET_S=$((225*60))      # garde : le job est limité à 300 min
+          declare -A NV NE
+          for POL in xml5g immediate slice none; do NV[$POL]=0; NE[$POL]=0; done
+          : > "$LOGS/63_validite.txt"
+          for TOUR in $(seq 1 $MAX_ESSAIS); do
           for POL in xml5g immediate slice none; do
-            RUN="${POL}_r${REP}"
-            echo "=== répétition $REP / $NREP, politique $POL ==="
-            arreter_ran
-            demarrer_ran "$RUN"
+            [ "${NV[$POL]}" -ge $NVALIDE ] && continue
+            if [ $(( $(date +%s) - DEBUT )) -gt $BUDGET_S ]; then echo "::warning::budget de temps atteint"; break 2; fi
+            NE[$POL]=$(( ${NE[$POL]} + 1 )); RUN="${POL}_r${NE[$POL]}"
+            echo "=== $RUN (essais valides : ${NV[$POL]}/$NVALIDE) ==="
+            ip1=""; ip2=""
+            for tentative in 1 2 3; do
+              arreter_ran
+              demarrer_ran "$RUN"
+              ip1=$(ue_pret 1); ip2=$(ue_pret 2)
+              [ -n "$ip1" ] && [ -n "$ip2" ] && break
+              echo "$RUN : démarrage $tentative incomplet (ue1='$ip1', ue2='$ip2')"
+            done
+            if [ -z "$ip1" ] || [ -z "$ip2" ]; then
+              echo "$RUN invalide UE_non_connecte" >> "$LOGS/63_validite.txt"
+              echo "$RUN : " >> "$LOGS/63_ues_par_politique.txt"
+              continue
+            fi
             # serveurs iperf3 remis à zéro, avec journal JSON côté serveur (débit reçu, pertes)
             docker exec oai-ext-dn pkill iperf3 > /dev/null 2>&1; sleep 1
             docker exec oai-ext-dn rm -f /tmp/iperf_5201.json /tmp/iperf_5202.json > /dev/null 2>&1
             for P in 5201 5202; do docker exec -d oai-ext-dn iperf3 -s -p $P -J --logfile /tmp/iperf_$P.json > /dev/null 2>&1; done
-            ip1=$(ue_pret 1); ip2=$(ue_pret 2)
             UESP=""; [ -n "$ip1" ] && UESP="ue1:$ip1"; [ -n "$ip2" ] && UESP="${UESP:+$UESP,}ue2:$ip2"
             echo "$RUN : $UESP" | tee -a "$LOGS/63_ues_par_politique.txt"
-            [ -n "$ip1" ] || echo "::error::$RUN : l'UE attaquant (ue1) n'est pas en service"
             XML5G_POLICY=$POL XML5G_W=10 XML5G_THETA=0.7 XML5G_DURATION=80 XML5G_PORT=9999 \
               sudo -E setsid nohup nice -n -10 stdbuf -oL "$WORK/oai/openair2/E2AP/flexric/build/examples/xApp/c/xapp_xml5g/xapp_xml5g" -c "$FR_CONF" -p "$SM_DIR/" > "$LOGS/60_xapp_$RUN.log" 2>&1 < /dev/null &
             XPID=$!
@@ -1968,8 +2041,17 @@ jobs:
             sleep 2
             # journaux iperf3 côté serveur (le test d'un UE coupé en cours peut ne pas être écrit)
             for P in 5201 5202; do docker exec oai-ext-dn cat /tmp/iperf_$P.json > "$LOGS/64_iperf_${RUN}_p$P.json" 2>/dev/null; done
+            if [ -s "$LOGS/62_ev_$RUN.jsonl" ]; then
+              echo "$RUN valide" >> "$LOGS/63_validite.txt"; NV[$POL]=$(( ${NV[$POL]} + 1 ))
+            else
+              echo "$RUN invalide attaque_non_lancee" >> "$LOGS/63_validite.txt"
+            fi
             sleep 1
           done
+          done
+          for POL in xml5g immediate slice none; do
+            echo "$POL : ${NV[$POL]} essais valides sur ${NE[$POL]}" | tee -a "$LOGS/09_etapes.txt"
+            [ "${NV[$POL]}" -ge $NVALIDE ] || echo "::warning::$POL : seulement ${NV[$POL]} essais valides"
           done
           arreter_ran
       - name: 11. Bilan
