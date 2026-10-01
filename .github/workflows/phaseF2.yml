@@ -1,4 +1,4 @@
-# xML5G — phase 2, CAMPAGNE FINALE CORRIGÉE : boucle complète détection -> décision -> action,
+# xML5G — phase 2, CAMPAGNE FINALE CORRIGÉE (profil radio léger, flood à débit limité) : boucle complète détection -> décision -> action,
 # 5 essais VALIDES par politique (essais sans UE connecté remplacés), trafic bénin à 0,5 Mbit/s
 # (sous la capacité du lien simulé), débit bénin mesuré à l'UPF, CPU et mémoire.
 # Reconstruit la plateforme (comme en phase 1), entraîne le détecteur retenu par
@@ -1357,6 +1357,7 @@ jobs:
               # 0,5 Mbit/s : sous la capacité montante du lien radio simulé (0,7 à 3,4 Mbit/s mesurés),
               # pour que l'UE bénin ne sature pas son propre lien et que son RTT de base reste faible
               ap.add_argument("--benign-rate", default="0.5M")
+              ap.add_argument("--flood-interval", default="u100", help="intervalle hping3 entre paquets (u100 = 100 µs)")
               ap.add_argument("--events", required=True)
               a = ap.parse_args()
               ues = dict(u.split(":") for u in a.ues.split(",") if ":" in u)
@@ -1387,7 +1388,9 @@ jobs:
                   time.sleep(max(0, st - (time.time() - t0)))
                   opt = "-S -p 80" if typ == "syn" else "--udp -p 5555"
                   start = time.time()
-                  p = sh(ns, f"timeout {du} hping3 --flood {opt} {a.dn}", bg=True, err=f"{base}_attaque{i}_{ns}.err")
+                  # débit limité (~10 000 paquets/s) plutôt que --flood : --flood occupe un cœur entier, ce qui
+                  # saturait la machine d'émulation ; 10 000 paquets/s restent un flood pour un seul UE
+                  p = sh(ns, f"timeout {du} hping3 -i {a.flood_interval} {opt} {a.dn}", bg=True, err=f"{base}_attaque{i}_{ns}.err")
                   p.wait()
                   end = time.time()
                   if end - start < 0.5 * du:
@@ -1601,20 +1604,26 @@ jobs:
               # qualité de service de l'UE bénin (l'autre UE)
               ns_b = "ue2" if e.get("ns") == "ue1" else "ue1"
               port_b = 5200 + int(ns_b[2:])
-              fin_att = o["debut_vers_liberation_s"] if o["attaquant_libere"] else fin
-              o["rtt_benin_avant_ms"], _ = rtt(f"62_ev_{R}_rtt_{ns_b}.txt", t0, -9, 0)
-              o["rtt_benin_attaque_ms"], o["rep_benin_attaque"] = rtt(f"62_ev_{R}_rtt_{ns_b}.txt", t0, 0, fin_att)
-              o["rtt_benin_apres_ms"], _ = rtt(f"62_ev_{R}_rtt_{ns_b}.txt", t0, fin_att, fin_att + 15)
+              # Qualité de service de l'UE bénin : MÊMES fenêtres pour toutes les politiques (sinon la comparaison
+              # est biaisée) : avant [-9, 0), pendant toute l'attaque [0, 40), seconde moitié de l'attaque [20, 40),
+              # qui montre si le service s'est rétabli après la coupure de l'attaquant.
+              FA = float(os.environ.get("FENETRE_ATTAQUE", "40"))
+              fr = f"62_ev_{R}_rtt_{ns_b}.txt"
+              o["rtt_benin_avant_ms"], rep_av = rtt(fr, t0, -9, 0)
+              o["rtt_benin_attaque_ms"], o["rep_benin_attaque"] = rtt(fr, t0, 0, FA)
+              o["rtt_benin_fin_attaque_ms"], _ = rtt(fr, t0, FA / 2, FA)
+              o["rtt_benin_apres_ms"] = o["rtt_benin_fin_attaque_ms"]
+              o["continuite_benin"] = (o["rep_benin_attaque"] / rep_av) if rep_av else None   # sondes répondues pendant/avant
               ip_b = UES_RUN.get(R, {}).get(ns_b)
               if ip_b:
                   o["pps_benin_avant"] = upf_pps(ip_b, t0, -9, 0)
-                  o["pps_benin_attaque"] = upf_pps(ip_b, t0, 0, fin_att)
-                  o["pps_benin_apres"] = upf_pps(ip_b, t0, fin_att, fin_att + 15)
+                  o["pps_benin_attaque"] = upf_pps(ip_b, t0, 0, FA)
+                  o["pps_benin_apres"] = upf_pps(ip_b, t0, FA / 2, FA)
                   if o["pps_benin_avant"]:
                       o["ratio_pps_benin"] = (o["pps_benin_attaque"] or 0) / o["pps_benin_avant"]
               o["debit_benin_avant"], _ = iperf(f"64_iperf_{R}_p{port_b}.json", t0, -9, 0)
-              o["debit_benin_attaque"], o["perte_benin_attaque"] = iperf(f"64_iperf_{R}_p{port_b}.json", t0, 0, fin_att)
-              o["debit_benin_apres"], _ = iperf(f"64_iperf_{R}_p{port_b}.json", t0, fin_att, fin_att + 15)
+              o["debit_benin_attaque"], o["perte_benin_attaque"] = iperf(f"64_iperf_{R}_p{port_b}.json", t0, 0, FA)
+              o["debit_benin_apres"], _ = iperf(f"64_iperf_{R}_p{port_b}.json", t0, FA / 2, FA)
               # CPU / mémoire
               for c, (cpu, rss) in pidstat(f"65_pidstat_{R}.txt").items():
                   k = {"python3": "detecteur", "xapp_xml5g": "xapp", "nr-softmodem": "gnb", "nr-uesoftmodem": "ue"}.get(c)
@@ -1704,19 +1713,21 @@ jobs:
 
           # ---------- qualité de service de l'UE bénin ----------
           md += ["### Qualité de service de l'UE bénin pendant l'attaque (moyenne sur les répétitions)", "",
-                 "Débit de l'UE bénin mesuré **à l'UPF** (paquets montants reçus par seconde) et RTT de sa sonde ping.", "",
-                 "| Politique | Paquets/s à l'UPF avant | pendant | après | Rapport pendant/avant | RTT médian avant (ms) | RTT pendant | RTT après |",
+                 "Mêmes fenêtres pour toutes les politiques : avant l'attaque [-9, 0 s), pendant l'attaque [0, 40 s),",
+                 "seconde moitié de l'attaque [20, 40 s). Débit mesuré **à l'UPF** (paquets montants reçus par seconde) ;",
+                 "continuité = part des sondes ping répondues pendant l'attaque, rapportée à celle d'avant.", "",
+                 "| Politique | Paquets/s à l'UPF avant | pendant | 2e moitié | Continuité | RTT médian avant (ms) | RTT pendant | RTT 2e moitié |",
                  "|---|---|---|---|---|---|---|---|"]
           for p in POLS:
               if not col(p, "rep"): continue
               g = lambda c, d=2: fmt(moy_ic(col(p, c))[0], d=d)
               md.append(f"| {NOMS[p]} | {g('pps_benin_avant', 1)} | {g('pps_benin_attaque', 1)} | {g('pps_benin_apres', 1)} | "
-                        f"{g('ratio_pps_benin', 2)} | {g('rtt_benin_avant_ms', 1)} | {g('rtt_benin_attaque_ms', 1)} | {g('rtt_benin_apres_ms', 1)} |")
+                        f"{g('continuite_benin', 2)} | {g('rtt_benin_avant_ms', 1)} | {g('rtt_benin_attaque_ms', 1)} | {g('rtt_benin_fin_attaque_ms', 1)} |")
           md.append("")
 
           # ---------- tests statistiques : xML5G contre chaque alternative ----------
           md += ["### Tests statistiques (xML5G contre chaque alternative)", "",
-                 "| Comparaison | UE bénins coupés (Fisher exact) | Débit bénin pendant/avant à l'UPF (Mann-Whitney) | RTT bénin pendant l'attaque (Mann-Whitney) |",
+                 "| Comparaison | UE bénins coupés (Fisher exact) | Continuité du service bénin (Mann-Whitney) | RTT bénin, 2e moitié de l'attaque (Mann-Whitney) |",
                  "|---|---|---|---|"]
           TESTS = []
           try:
@@ -1731,7 +1742,7 @@ jobs:
                       a_ = [v for v in col("xml5g", c) if v is not None]; b_ = [v for v in col(p, c) if v is not None]
                       if len(a_) < 2 or len(b_) < 2: return None
                       return mannwhitneyu(a_, b_, alternative="two-sided").pvalue
-                  pd_, pr_ = mw("ratio_pps_benin"), mw("rtt_benin_attaque_ms")
+                  pd_, pr_ = mw("continuite_benin"), mw("rtt_benin_fin_attaque_ms")
                   TESTS.append(dict(comparaison=f"xml5g_vs_{p}", fisher_benins=pf, mw_debit=pd_, mw_rtt=pr_))
                   md.append(f"| xML5G vs {NOMS[p]} | p = {pf:.3f} ({bx}/{nx} vs {bp}/{n}) | "
                             f"{'p = %.3f' % pd_ if pd_ is not None else '—'} | {'p = %.3f' % pr_ if pr_ is not None else '—'} |")
@@ -1791,6 +1802,10 @@ jobs:
             nn > 0 and sum(col("none", "regle_sur_attaquant")) >= 0.8 * nn and sum(col("none", "regle_sur_benins")) == 0),
            ("Qualité de service de l'UE bénin mesurée (RTT et débit à l'UPF) dans tous les essais valides",
             bool(RUNS) and all(o["rtt_benin_avant_ms"] is not None and o["pps_benin_avant"] is not None for o in RUNS)),
+           (f"Plateforme non saturée : RTT de base médian de l'UE bénin < 150 ms "
+            f"({(st.median([o['rtt_benin_avant_ms'] for o in RUNS if o.get('rtt_benin_avant_ms')]) if RUNS else float('nan')):.0f} ms ; "
+            f"sinon la qualité de service mesure la charge de l'émulateur)",
+            bool(RUNS) and st.median([o['rtt_benin_avant_ms'] for o in RUNS if o.get('rtt_benin_avant_ms')] or [1e9]) < 150),
            ("CPU et mémoire de l'xApp et du détecteur mesurés dans tous les essais valides",
             bool(RUNS) and all(o.get("cpu_xapp_pct") is not None and o.get("cpu_detecteur_pct") is not None for o in RUNS)),
           ]
@@ -1851,13 +1866,47 @@ jobs:
           sudo setsid nohup stdbuf -oL -eL "$FR/examples/ric/nearRT-RIC" -c "$FR_CONF" -p "$SM_DIR/" > "$LOGS/10_ric.log" 2>&1 < /dev/null &
           sleep 3
           B="$WORK/oai/cmake_targets/ran_build/build"
-          CONF="$WORK/oai/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf"
-          sudo setsid nohup stdbuf -oL -eL "$B/nr-softmodem" -O "$CONF" '--gNBs.[0].min_rxtxtime' 6 --rfsim --e2_agent.sm_dir "$SM_DIR/" > "$LOGS/11_gnb.log" 2>&1 < /dev/null &
-          for i in $(seq 1 60); do grep -q "Received NGSetupResponse from AMF" "$LOGS/11_gnb.log" && grep -q "E2 SETUP RESPONSE rx" "$LOGS/11_gnb.log" && break; sleep 2; done
+          CD="$WORK/oai/targets/PROJECTS/GENERIC-NR-5GC/CONF"
+          CONF106="$CD/gnb.sa.band78.fr1.106PRB.usrpb210.conf"
+          # PROFIL RADIO LÉGER : 25 PRB à 15 kHz (5 MHz) au lieu de 106 PRB à 30 kHz (40 MHz), soit
+          # environ 8 fois moins d'échantillons radio à calculer. Avec 106 PRB, l'émulation saturait les
+          # 4 cœurs avant toute attaque (gNB ~170 %, chaque UE ~100 %) et le RTT mesurait la charge de la
+          # machine. Configuration rfsim d'OAI adaptée à notre cœur (PLMN 001/01, adresses, agent E2).
+          LIGHT="$WORK/gnb_light.conf"
+          sed -e 's/mcc = 208; mnc = 99;/mcc = 001; mnc = 01;/' \
+              -e 's/192\.168\.71\.132/192.168.70.132/' \
+              -e 's#192\.168\.71\.140/26#192.168.70.129/24#g' "$CD/gnb.sa.band66.u0.25prb.rfsim.conf" > "$LIGHT"
+          printf '\ne2_agent = {\n  near_ric_ip_addr = "127.0.0.1";\n  sm_dir = "/usr/local/lib/flexric/"\n};\n' >> "$LIGHT"
+          grep -nE "mcc|amf_ip_address|GNB_IPV4|e2_agent|near_ric" "$LIGHT" > "$LOGS/07_gnb_light_conf.txt"
+          lancer_gnb() {   # $1 = configuration, $2 = suffixe du journal
+            sudo setsid nohup stdbuf -oL -eL "$B/nr-softmodem" -O "$1" '--gNBs.[0].min_rxtxtime' 6 --rfsim --e2_agent.sm_dir "$SM_DIR/" > "$LOGS/11_gnb$2.log" 2>&1 < /dev/null &
+            for i in $(seq 1 60); do grep -q "Received NGSetupResponse from AMF" "$LOGS/11_gnb$2.log" && grep -q "E2 SETUP RESPONSE rx" "$LOGS/11_gnb$2.log" && return 0; sleep 2; done
+            return 1
+          }
+          creer_ue() {     # espace de noms et fichier de l'UE $1 (une seule fois)
+            [ -e "/var/run/netns/ue$1" ] || sudo bash "$WORK/oai/tools/scripts/multi-ue.sh" -c$1
+            printf 'uicc0 = {\nimsi = "00101000000000%s";\nkey = "fec86ba6eb707ed08905757b1bb44b8f";\nopc= "C42449363BBAD02B66D16BC975D77CC1";\npdu_sessions = ({ dnn = "oai"; nssai_sst = 1; });\n}\n' "$1" > "$WORK/ue$1.conf"
+          }
+          # essai préalable du profil léger : gNB attaché à l'AMF et au RIC, puis UE1 attaché
+          PROFIL=106PRB; GNB_CONF="$CONF106"; UE_RF="-r 106 --numerology 1 --band 78 -C 3619200000"
+          if lancer_gnb "$LIGHT" "_essai_leger"; then
+            creer_ue 1
+            sudo setsid nohup stdbuf -oL -eL ip netns exec ue1 "$B/nr-uesoftmodem" -O "$WORK/ue1.conf" -r 25 --numerology 0 --band 66 -C 2152680000 --ssb 48 --rfsim '--rfsimulator.[0].serveraddr' "10.201.1.100" > "$LOGS/12_ue1_essai_leger.log" 2>&1 < /dev/null &
+            for i in $(seq 1 40); do sudo ip netns exec ue1 ip -o -4 addr show 2>/dev/null | grep -q oaitun && { PROFIL=leger; break; }; sleep 3; done
+          fi
+          sudo pkill -f nr-uesoftmodem; sudo pkill -f nr-softmodem; sleep 5
+          if [ "$PROFIL" = leger ]; then
+            GNB_CONF="$LIGHT"; UE_RF="-r 25 --numerology 0 --band 66 -C 2152680000 --ssb 48"
+          else
+            echo "::warning::profil radio léger non opérationnel : retour à la configuration 106 PRB"
+          fi
+          echo "profil_radio=$PROFIL" >> "$LOGS/09_etapes.txt"
+          echo "GNB_CONF=$GNB_CONF" >> "$GITHUB_ENV"; echo "UE_RF=$UE_RF" >> "$GITHUB_ENV"
+          lancer_gnb "$GNB_CONF" "" || echo "::error::le gNB ne s'attache pas à l'AMF ou au RIC"
           UES=""
           for k in 1 2; do
-            sudo bash "$WORK/oai/tools/scripts/multi-ue.sh" -c$k
-            cat > "$WORK/ue$k.conf" <<UECONF_EOF
+            creer_ue $k
+            cat > /dev/null <<UECONF_EOF
           uicc0 = {
           imsi = "00101000000000$k";
           key = "fec86ba6eb707ed08905757b1bb44b8f";
@@ -1867,7 +1916,7 @@ jobs:
           UECONF_EOF
             ip_ue=""
             for essai in 1 2 3; do
-              sudo setsid nohup stdbuf -oL -eL ip netns exec ue$k "$B/nr-uesoftmodem" -O "$WORK/ue$k.conf" -r 106 --numerology 1 --band 78 -C 3619200000 --rfsim '--rfsimulator.[0].serveraddr' "10.20$k.1.100" >> "$LOGS/12_ue$k.log" 2>&1 < /dev/null &
+              sudo setsid nohup stdbuf -oL -eL ip netns exec ue$k "$B/nr-uesoftmodem" -O "$WORK/ue$k.conf" $UE_RF --rfsim '--rfsimulator.[0].serveraddr' "10.20$k.1.100" >> "$LOGS/12_ue$k.log" 2>&1 < /dev/null &
               sleep 5
               for i in $(seq 1 40); do
                 ip_ue=$(sudo ip netns exec ue$k ip -o -4 addr show 2>/dev/null | grep oaitun | awk '{print $4}' | cut -d/ -f1)
@@ -1943,7 +1992,7 @@ jobs:
           cd "$WORK/py"
           B="$WORK/oai/cmake_targets/ran_build/build"
           FR="$WORK/oai/openair2/E2AP/flexric/build"
-          CONF="$WORK/oai/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf"
+          CONF="$GNB_CONF"
 
           # Couper un UE en cours de session fait planter le gNB de cette version d'OAI
           # (assertion seq_arr_end). On REDÉMARRE donc RIC + gNB + UEs entre CHAQUE
@@ -1963,7 +2012,7 @@ jobs:
               sleep 2
             done
             for k in 1 2; do
-              sudo setsid nohup stdbuf -oL -eL ip netns exec ue$k "$B/nr-uesoftmodem" -O "$WORK/ue$k.conf" -r 106 --numerology 1 --band 78 -C 3619200000 --rfsim '--rfsimulator.[0].serveraddr' "10.20$k.1.100" >> "$LOGS/12_ue$k.log" 2>&1 < /dev/null &
+              sudo setsid nohup stdbuf -oL -eL ip netns exec ue$k "$B/nr-uesoftmodem" -O "$WORK/ue$k.conf" $UE_RF --rfsim '--rfsimulator.[0].serveraddr' "10.20$k.1.100" >> "$LOGS/12_ue$k.log" 2>&1 < /dev/null &
             done
           }
           # Remet l'UE k en service et garantit sa route + sa connectivité. Renvoie l'adresse (vide si échec).
@@ -1978,7 +2027,7 @@ jobs:
               fi
               echo "UE$k pas encore prêt (essai $essai)" >&2
               sudo pkill -f "ue$k.conf"; sleep 5
-              sudo setsid nohup stdbuf -oL -eL ip netns exec ue$k "$B/nr-uesoftmodem" -O "$WORK/ue$k.conf" -r 106 --numerology 1 --band 78 -C 3619200000 --rfsim '--rfsimulator.[0].serveraddr' "10.20$k.1.100" >> "$LOGS/12_ue$k.log" 2>&1 < /dev/null &
+              sudo setsid nohup stdbuf -oL -eL ip netns exec ue$k "$B/nr-uesoftmodem" -O "$WORK/ue$k.conf" $UE_RF --rfsim '--rfsimulator.[0].serveraddr' "10.20$k.1.100" >> "$LOGS/12_ue$k.log" 2>&1 < /dev/null &
               for i in $(seq 1 40); do sudo ip netns exec ue$k ip -o -4 addr show 2>/dev/null | grep -q oaitun && break; sleep 3; done
               sleep 5
             done
