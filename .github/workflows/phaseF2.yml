@@ -1,5 +1,4 @@
-# xML5G — phase 2, CAMPAGNE FINALE (profil radio léger, flood UDP à gros paquets, goulot d'étranglement 20 Mbit/s en
-# sortie d'UPF) : l'attaque sature le lien partagé et dégrade l'UE bénin (RTT et débit), que la coupure rétablit.
+# xML5G — phase 2, CAMPAGNE FINALE CORRIGÉE (profil radio léger, flood à débit limité) : boucle complète détection -> décision -> action,
 # 5 essais VALIDES par politique (essais sans UE connecté remplacés), trafic bénin à 0,5 Mbit/s
 # (sous la capacité du lien simulé), débit bénin mesuré à l'UPF, CPU et mémoire.
 # Reconstruit la plateforme (comme en phase 1), entraîne le détecteur retenu par
@@ -1387,8 +1386,6 @@ jobs:
                       print(f"ATTENTION : {ns} n'a pas d'adresse (--ues), attaque {i} ignorée")
                       continue
                   time.sleep(max(0, st - (time.time() - t0)))
-                  # SYN : petits paquets (épuise la table de connexions). UDP : gros paquets (-d 1400)
-                  # pour saturer en DÉBIT le goulot d'étranglement en sortie d'UPF et dégrader l'UE bénin.
                   opt = "-S -p 80" if typ == "syn" else "--udp -p 5555 -d 1400"
                   start = time.time()
                   # débit limité (~10 000 paquets/s) plutôt que --flood : --flood occupe un cœur entier, ce qui
@@ -1906,13 +1903,33 @@ jobs:
           echo "profil_radio=$PROFIL" >> "$LOGS/09_etapes.txt"
           echo "GNB_CONF=$GNB_CONF" >> "$GITHUB_ENV"; echo "UE_RF=$UE_RF" >> "$GITHUB_ENV"
           lancer_gnb "$GNB_CONF" "" || echo "::error::le gNB ne s'attache pas à l'AMF ou au RIC"
+          mkdir -p "$WORK"
+          cat > "$WORK/goulot.sh" <<'GOULOT_SH'
+          BW_GOULOT="${BW_GOULOT:-20mbit}"
+          docker exec oai-upf sh -c "command -v tc >/dev/null 2>&1" || docker exec oai-upf sh -c "(apt-get update && apt-get install -y iproute2) >/dev/null 2>&1 || (apk add --no-cache iproute2) >/dev/null 2>&1" || echo "::warning::tc indisponible dans oai-upf"
+          upf_if() { docker exec oai-upf sh -c 'ip -o link 2>/dev/null | sed -E "s/^[0-9]+: ([^:@]+).*/\1/" | grep -E "tun|gtp|ogstun" | head -1' | tr -d "\r"; }
+          upf_if_fallback() { docker exec oai-upf sh -c 'ip route show default 2>/dev/null | awk "{for(i=1;i<=NF;i++) if(\$i==\"dev\") print \$(i+1)}" | head -1' | tr -d "\r"; }
+          poser_goulot() {
+            IF=$(upf_if); [ -z "$IF" ] && IF=$(upf_if_fallback); [ -z "$IF" ] && IF=eth0
+            GOULOT_IF=""; GOULOT_DEV=""; : > /tmp/tcerr
+            docker exec oai-upf tc qdisc del dev "$IF" root 2>/dev/null
+            if docker exec oai-upf tc qdisc add dev "$IF" root tbf rate "$BW_GOULOT" burst 32kbit latency 50ms 2>>/tmp/tcerr; then
+              GOULOT_IF="$IF"; GOULOT_DEV="$IF"; echo "goulot=$BW_GOULOT (tbf sur $IF)" | tee -a "$LOGS/09_etapes.txt"; return; fi
+            docker exec oai-upf sh -c "modprobe ifb numifbs=1 2>/dev/null; ip link add ifb0 type ifb 2>/dev/null; ip link set ifb0 up 2>/dev/null" 2>/dev/null
+            docker exec oai-upf tc qdisc del dev "$IF" ingress 2>/dev/null; docker exec oai-upf tc qdisc del dev ifb0 root 2>/dev/null
+            if docker exec oai-upf tc qdisc add dev "$IF" handle ffff: ingress 2>>/tmp/tcerr && docker exec oai-upf tc filter add dev "$IF" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev ifb0 2>>/tmp/tcerr && docker exec oai-upf tc qdisc add dev ifb0 root handle 1: htb default 10 2>>/tmp/tcerr && docker exec oai-upf tc class add dev ifb0 parent 1: classid 1:10 htb rate "$BW_GOULOT" ceil "$BW_GOULOT" burst 15k quantum 1514 2>>/tmp/tcerr; then
+              docker exec oai-upf tc qdisc add dev ifb0 parent 1:10 handle 10: netem limit 100 2>/dev/null || docker exec oai-upf tc qdisc add dev ifb0 parent 1:10 handle 10: bfifo limit 150000 2>/dev/null || true
+              GOULOT_IF="$IF"; GOULOT_DEV="ifb0"; echo "goulot=$BW_GOULOT (ingress $IF -> ifb0)" | tee -a "$LOGS/09_etapes.txt"; return; fi
+            echo "::error::goulot NON pose sur '$IF' : $(head -1 /tmp/tcerr 2>/dev/null)"; echo "goulot=ECHEC sur $IF" >> "$LOGS/09_etapes.txt"
+          }
+          verifier_goulot() { [ -z "$GOULOT_DEV" ] && return 1; docker exec oai-upf tc -s qdisc show dev "$GOULOT_DEV" 2>/dev/null | grep -qE "tbf|htb"; }
+          GOULOT_SH
+          . "$WORK/goulot.sh"
           poser_goulot
           if verifier_goulot; then
-            echo "::notice::goulot d'etranglement actif sur $GOULOT_IF ($BW_GOULOT)"
-            echo "goulot_verifie=oui" >> "$LOGS/09_etapes.txt"
+            echo "::notice::goulot actif sur $GOULOT_DEV ($BW_GOULOT)"; echo "goulot_verifie=oui" >> "$LOGS/09_etapes.txt"
           else
-            echo "::warning::goulot d'etranglement INACTIF — le RTT ne se degradera pas ; verifier le nom d'interface UPF"
-            echo "goulot_verifie=non" >> "$LOGS/09_etapes.txt"
+            echo "::warning::goulot INACTIF - verifier le nom d'interface UPF"; echo "goulot_verifie=non" >> "$LOGS/09_etapes.txt"
             docker exec oai-upf sh -c "ip -o link; echo ---QDISC---; tc qdisc show; echo ---IFB0---; tc -s qdisc show dev ifb0 2>&1; echo ---ERR---; cat /tmp/tcerr 2>/dev/null" > "$LOGS/07_upf_interfaces.txt" 2>&1 || true
           fi
           UES=""
@@ -2010,54 +2027,6 @@ jobs:
           # (assertion seq_arr_end). On REDÉMARRE donc RIC + gNB + UEs entre CHAQUE
           # politique, sur une plateforme propre. Et on teste xml5g EN PREMIER : c'est le
           # résultat le plus important, on l'obtient même si une politique ultérieure casse.
-          # GOULOT D'ÉTRANGLEMENT partagé par tous les UE d'une tranche : sans point de contention commun,
-          # un flood ne gêne pas l'UE bénin et le RTT ne mesure que la charge de l'émulateur. On limite le
-          # débit sortant de l'interface de données de l'UPF (tun/tap vers oai-ext-dn) à BW_GOULOT.
-          BW_GOULOT="${BW_GOULOT:-20mbit}"
-          # tc et iproute2 doivent être présents DANS le conteneur UPF ; sinon on les installe une fois.
-          docker exec oai-upf sh -c "command -v tc >/dev/null 2>&1" || \
-            docker exec oai-upf sh -c "(apt-get update && apt-get install -y iproute2) >/dev/null 2>&1 || (apk add --no-cache iproute2) >/dev/null 2>&1" || \
-            echo "::warning::impossible d'installer tc dans oai-upf"
-          # Interface de données de l'UPF (N6 vers le réseau de données). Le nom varie selon la version d'OAI :
-          # on prend la première interface « tun » ; à défaut la route par défaut ; à défaut eth0.
-          upf_if() {
-            docker exec oai-upf sh -c '
-              ip -o link 2>/dev/null | sed -E "s/^[0-9]+: ([^:@]+).*/\1/" | grep -E "tun|gtp|ogstun" | head -1
-              ' | tr -d "\r"
-          }
-          upf_if_fallback() {
-            docker exec oai-upf sh -c 'ip route show default 2>/dev/null | awk "{for(i=1;i<=NF;i++) if(\$i==\"dev\") print \$(i+1)}" | head -1' | tr -d "\r"
-          }
-          poser_goulot() {
-            local IF; IF=$(upf_if); [ -z "$IF" ] && IF=$(upf_if_fallback); [ -z "$IF" ] && IF=eth0
-            GOULOT_IF=""; GOULOT_DEV=""
-            : > /tmp/tcerr
-            # --- Méthode 1 : tbf directement sur l'interface de données (tient sur une tun point-à-point) ---
-            docker exec oai-upf tc qdisc del dev "$IF" root 2>/dev/null
-            if docker exec oai-upf tc qdisc add dev "$IF" root tbf rate "$BW_GOULOT" burst 32kbit latency 50ms 2>>/tmp/tcerr; then
-              GOULOT_IF="$IF"; GOULOT_DEV="$IF"
-              echo "goulot=$BW_GOULOT (tbf sur $IF)" | tee -a "$LOGS/09_etapes.txt"; return
-            fi
-            # --- Méthode 2 : redirection ingress de l'interface vers une IFB, puis htb sur l'IFB ---
-            docker exec oai-upf sh -c "modprobe ifb numifbs=1 2>/dev/null; ip link add ifb0 type ifb 2>/dev/null; ip link set ifb0 up 2>/dev/null" 2>/dev/null
-            docker exec oai-upf tc qdisc del dev "$IF" ingress 2>/dev/null
-            docker exec oai-upf tc qdisc del dev ifb0 root 2>/dev/null
-            if docker exec oai-upf tc qdisc add dev "$IF" handle ffff: ingress 2>>/tmp/tcerr \
-               && docker exec oai-upf tc filter add dev "$IF" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev ifb0 2>>/tmp/tcerr \
-               && docker exec oai-upf tc qdisc add dev ifb0 root handle 1: htb default 10 2>>/tmp/tcerr \
-               && docker exec oai-upf tc class add dev ifb0 parent 1: classid 1:10 htb rate "$BW_GOULOT" ceil "$BW_GOULOT" burst 15k quantum 1514 2>>/tmp/tcerr; then
-              docker exec oai-upf tc qdisc add dev ifb0 parent 1:10 handle 10: netem limit 100 2>/dev/null \
-                || docker exec oai-upf tc qdisc add dev ifb0 parent 1:10 handle 10: bfifo limit 150000 2>/dev/null || true
-              GOULOT_IF="$IF"; GOULOT_DEV="ifb0"
-              echo "goulot=$BW_GOULOT (ingress $IF -> ifb0)" | tee -a "$LOGS/09_etapes.txt"; return
-            fi
-            echo "::error::goulot NON posé sur '$IF' : $(head -1 /tmp/tcerr 2>/dev/null)"
-            echo "goulot=ECHEC sur $IF" >> "$LOGS/09_etapes.txt"
-          }
-          verifier_goulot() {   # confirme que la limite (tbf ou htb) est réellement active sur le bon device
-            [ -z "$GOULOT_DEV" ] && return 1
-            docker exec oai-upf tc -s qdisc show dev "$GOULOT_DEV" 2>/dev/null | grep -qE "tbf|htb"
-          }
           arreter_ran() {
             sudo pkill -f nr-uesoftmodem; sudo pkill -f nr-softmodem; sudo pkill -f nearRT-RIC
             sleep 5
@@ -2098,6 +2067,7 @@ jobs:
           # l'UE attaquant ET l'UE bénin sont en service et si l'attaque a bien été lancée.
           # Si un UE ne se connecte pas, la plateforme est redémarrée (3 tentatives) ; un essai
           # resté invalide est noté et remplacé par un essai supplémentaire.
+          . "$WORK/goulot.sh"
           NVALIDE=5; MAX_ESSAIS=8
           DEBUT=$(date +%s); BUDGET_S=$((225*60))      # garde : le job est limité à 300 min
           declare -A NV NE
