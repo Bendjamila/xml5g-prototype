@@ -1913,7 +1913,7 @@ jobs:
           else
             echo "::warning::goulot d'etranglement INACTIF — le RTT ne se degradera pas ; verifier le nom d'interface UPF"
             echo "goulot_verifie=non" >> "$LOGS/09_etapes.txt"
-            docker exec oai-upf sh -c "ip -o link" > "$LOGS/07_upf_interfaces.txt" 2>&1 || true
+            docker exec oai-upf sh -c "ip -o link; echo ---QDISC---; tc qdisc show; echo ---IFB0---; tc -s qdisc show dev ifb0 2>&1; echo ---ERR---; cat /tmp/tcerr 2>/dev/null" > "$LOGS/07_upf_interfaces.txt" 2>&1 || true
           fi
           UES=""
           for k in 1 2; do
@@ -2030,20 +2030,33 @@ jobs:
           }
           poser_goulot() {
             local IF; IF=$(upf_if); [ -z "$IF" ] && IF=$(upf_if_fallback); [ -z "$IF" ] && IF=eth0
+            GOULOT_IF=""; GOULOT_DEV=""
+            : > /tmp/tcerr
+            # --- Méthode 1 : tbf directement sur l'interface de données (tient sur une tun point-à-point) ---
             docker exec oai-upf tc qdisc del dev "$IF" root 2>/dev/null
-            # htb : un seul lien partagé à BW_GOULOT ; netem ajoute une file courte -> le flood la remplit, le RTT monte
-            if docker exec oai-upf tc qdisc add dev "$IF" root handle 1: htb default 10 2>/tmp/tcerr \
-               && docker exec oai-upf tc class add dev "$IF" parent 1: classid 1:10 htb rate "$BW_GOULOT" ceil "$BW_GOULOT" 2>>/tmp/tcerr \
-               && docker exec oai-upf tc qdisc add dev "$IF" parent 1:10 handle 10: netem limit 100 2>>/tmp/tcerr; then
-              GOULOT_IF="$IF"; echo "goulot=$BW_GOULOT sur $IF" | tee -a "$LOGS/09_etapes.txt"
-            else
-              GOULOT_IF=""; echo "::error::goulot NON posé sur '$IF' : $(cat /tmp/tcerr 2>/dev/null | head -1)"
-              echo "goulot=ECHEC sur $IF" >> "$LOGS/09_etapes.txt"
+            if docker exec oai-upf tc qdisc add dev "$IF" root tbf rate "$BW_GOULOT" burst 32kbit latency 50ms 2>>/tmp/tcerr; then
+              GOULOT_IF="$IF"; GOULOT_DEV="$IF"
+              echo "goulot=$BW_GOULOT (tbf sur $IF)" | tee -a "$LOGS/09_etapes.txt"; return
             fi
+            # --- Méthode 2 : redirection ingress de l'interface vers une IFB, puis htb sur l'IFB ---
+            docker exec oai-upf sh -c "modprobe ifb numifbs=1 2>/dev/null; ip link add ifb0 type ifb 2>/dev/null; ip link set ifb0 up 2>/dev/null" 2>/dev/null
+            docker exec oai-upf tc qdisc del dev "$IF" ingress 2>/dev/null
+            docker exec oai-upf tc qdisc del dev ifb0 root 2>/dev/null
+            if docker exec oai-upf tc qdisc add dev "$IF" handle ffff: ingress 2>>/tmp/tcerr \
+               && docker exec oai-upf tc filter add dev "$IF" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev ifb0 2>>/tmp/tcerr \
+               && docker exec oai-upf tc qdisc add dev ifb0 root handle 1: htb default 10 2>>/tmp/tcerr \
+               && docker exec oai-upf tc class add dev ifb0 parent 1: classid 1:10 htb rate "$BW_GOULOT" ceil "$BW_GOULOT" burst 15k quantum 1514 2>>/tmp/tcerr; then
+              docker exec oai-upf tc qdisc add dev ifb0 parent 1:10 handle 10: netem limit 100 2>/dev/null \
+                || docker exec oai-upf tc qdisc add dev ifb0 parent 1:10 handle 10: bfifo limit 150000 2>/dev/null || true
+              GOULOT_IF="$IF"; GOULOT_DEV="ifb0"
+              echo "goulot=$BW_GOULOT (ingress $IF -> ifb0)" | tee -a "$LOGS/09_etapes.txt"; return
+            fi
+            echo "::error::goulot NON posé sur '$IF' : $(head -1 /tmp/tcerr 2>/dev/null)"
+            echo "goulot=ECHEC sur $IF" >> "$LOGS/09_etapes.txt"
           }
-          verifier_goulot() {   # confirme que la limite htb est réellement active, sinon arrête la campagne
-            [ -z "$GOULOT_IF" ] && return 1
-            docker exec oai-upf tc -s qdisc show dev "$GOULOT_IF" 2>/dev/null | grep -q "htb"
+          verifier_goulot() {   # confirme que la limite (tbf ou htb) est réellement active sur le bon device
+            [ -z "$GOULOT_DEV" ] && return 1
+            docker exec oai-upf tc -s qdisc show dev "$GOULOT_DEV" 2>/dev/null | grep -qE "tbf|htb"
           }
           arreter_ran() {
             sudo pkill -f nr-uesoftmodem; sudo pkill -f nr-softmodem; sudo pkill -f nearRT-RIC
