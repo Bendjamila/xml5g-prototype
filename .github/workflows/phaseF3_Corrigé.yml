@@ -1662,10 +1662,16 @@ jobs:
           for l in lire("63_validite.txt").splitlines():
               f = l.split()
               if len(f) >= 2: VALIDITE[f[0]] = (f[1] == "valide", " ".join(f[2:]))
-          UES_RUN = {}
+          # UE de chaque essai. Deux formats : « RUN : ue1:ip,ue2:ip » (__9_) et, en phase 3,
+          # « RUN : attaquants=ue1:ip bénins=ue2:ip,ue3:ip ». BENINS_RUN garde l'ordre des UE bénins : le premier est
+          # l'UE bénin de référence, celui dont scenario.py mesure le débit et le RTT.
+          UES_RUN, BENINS_RUN = {}, {}
           for l in lire("63_ues_par_politique.txt").splitlines():
               run, _, v = l.partition(" : ")
-              UES_RUN[run.strip()] = dict(x.split(":") for x in v.strip().split(",") if ":" in x)
+              UES_RUN[run.strip()] = dict(re.findall(r"(ue\d+):(\d+(?:\.\d+){3})", v))
+              mb = re.search(r"b\S*nins=(\S*)", v)
+              if mb:
+                  BENINS_RUN[run.strip()] = re.findall(r"(ue\d+):", mb.group(1))
           def upf_pps(ip, t0, a, b):
               """paquets montants par seconde de l'UE à l'UPF, en moyenne sur [t0+a, t0+b) (secondes sans paquet = 0)."""
               ser = UPF.get(ip, {})
@@ -1730,20 +1736,30 @@ jobs:
               x = lire(f"60_xapp_{R}.log")
               if not x: return None
               s = js(f"61_ids_{R}_summary.json")
-              ev = [json.loads(l) for l in lire(f"62_ev_{R}.jsonl").splitlines() if l.strip()]
-              e = ev[0] if ev else None
+              ev = []
+              for l in lire(f"62_ev_{R}.jsonl").splitlines():
+                  try:
+                      j = json.loads(l)
+                  except ValueError:
+                      continue
+                  ev += [d for d in (j if isinstance(j, list) else [j]) if isinstance(d, dict) and not d.get("benign")]
+              e = ev[0] if ev else None          # premier attaquant : référence des délais
               ul = {int(t): u for t, u in RE_MAP.findall(x)}
-              atk_ue = None
-              if e:
+
+              def ue_de(ip):
                   for teid, d in (s or {}).items():
-                      if d.get("ip") == e["ip"] and (int(teid) & 0xFF) in ul:
-                          atk_ue = ul[int(teid) & 0xFF]
+                      if teid != "_boucle" and isinstance(d, dict) and d.get("ip") == ip and (int(teid) & 0xFF) in ul:
+                          return ul[int(teid) & 0xFF]
+                  return None
+              atk_ue = ue_de(e["ip"]) if e else None
+              atk_tous = {u for u in (ue_de(d["ip"]) for d in ev) if u is not None}   # scénario multi : tous les attaquants
               summ = {u: dict(v=int(v), a=int(al)) for u, v, al, _ in RE_SUM.findall(x)}
               o_throttle = [m for m in re.findall(r"THROTTLE ran_ue_id=(\d+) ip=(\S+) .* result=(-?\d+)", x)]
               o_persist = [m for m in re.findall(r"PERSIST ran_ue_id=(\d+) ip=(\S+) .* result=(-?\d+)", x)]
               mm = re.search(r"unmapped_verdicts=(\d+)", x)
               o = dict(politique=pol, scenario=scen or "udp", rep=r, verdicts=sum(v["v"] for v in summ.values()),
                        non_associes=int(mm.group(1)) if mm else None, attaquant_libere=0, benins_liberes=0,
+                       n_attaquants=len(ev), attaquants_liberes=0,
                        alarme_vers_commande_ms=None, decision_vers_ack_ms=None, debut_vers_liberation_s=None,
                        debut_vers_1re_alarme_s=None, debut_vers_flood_upf_s=None,
                        regle_sur_attaquant=0, regle_sur_benins=0,
@@ -1759,17 +1775,19 @@ jobs:
               t0 = e["start"]; fin = e["end"] - t0
               for u, al, dec, se, ak, res in RE_REL.findall(x):
                   if res != "ACK": continue
+                  if u in atk_tous:
+                      o["attaquants_liberes"] += 1
                   if atk_ue is not None and u == atk_ue:
                       o["attaquant_libere"] = 1
                       o["alarme_vers_commande_ms"] = round((int(se) - int(al)) / 1e3, 1) if int(al) else None
                       o["decision_vers_ack_ms"] = round((int(ak) - int(dec)) / 1e3, 2)
                       o["debut_vers_liberation_s"] = round(int(ak) / 1e6 - t0, 2)
                       o["debut_vers_1re_alarme_s"] = round(int(al) / 1e6 - t0, 2) if int(al) else None
-                  else:
+                  elif u not in atk_tous:
                       o["benins_liberes"] += 1
               for u in re.findall(r"WOULD_RELEASE ran_ue_id=(\d+)", x):
                   if atk_ue is not None and u == atk_ue: o["regle_sur_attaquant"] = 1
-                  else: o["regle_sur_benins"] += 1
+                  elif u not in atk_tous: o["regle_sur_benins"] += 1
               # verdicts du détecteur : attaquant dans la fenêtre d'attaque, UE bénin partout
               a_n = a_p = b_n = b_p = 0; t_al = None
               for l in lire(f"61_ids_{R}.log").splitlines():
@@ -1815,7 +1833,8 @@ jobs:
                       if ser.get(int(t0) + k, 0) >= seuil:
                           o["debut_vers_flood_upf_s"] = k; break
               # qualité de service de l'UE bénin (l'autre UE)
-              ns_b = "ue2" if e.get("ns") == "ue1" else "ue1"
+              ben = BENINS_RUN.get(R)
+              ns_b = ben[0] if ben else ("ue2" if e.get("ns") == "ue1" else "ue1")
               port_b = 5200 + int(ns_b[2:])
               # Qualité de service de l'UE bénin : MÊMES fenêtres pour toutes les politiques (sinon la comparaison
               # est biaisée) : avant [-9, 0), pendant toute l'attaque [0, 40), seconde moitié de l'attaque [20, 40),
@@ -3219,8 +3238,10 @@ jobs:
             case "$1" in
               udp)   ATKS="ue1:udp:10:$DUREE_ATTAQUE"; NB_ATT=1 ;;
               syn)   ATKS="ue1:syn:10:$DUREE_ATTAQUE"; NB_ATT=1 ;;
-              multi) ATKS="ue1:udp:10:$DUREE_ATTAQUE,ue2:syn:10:$DUREE_ATTAQUE"; NB_ATT=2 ;;
-              flash) ATKS=""; NB_ATT=1 ;;   # pas d'attaque : flash crowd bénin seul (le pire cas pour la règle)
+              # deux attaquants SUCCESSIFS : scenario.py (inchangé) enchaîne ses attaques l'une après l'autre ;
+              # chacune dure la moitié de la fenêtre pour que les deux tiennent dans l'essai (55 s)
+              multi) ATKS="ue1:udp:10:$(( DUREE_ATTAQUE / 2 )),ue2:syn:$(( 10 + DUREE_ATTAQUE / 2 )):$(( DUREE_ATTAQUE / 2 ))"; NB_ATT=2 ;;
+              flash) ATKS=""; NB_ATT=0 ;;   # pas d'attaque, aucun attaquant : flash crowd bénin seul (le pire cas pour la règle)
             esac
           }
 
@@ -3282,6 +3303,9 @@ jobs:
               done
               UESP=""; for k in $(seq 1 "$NB_ATT"); do UESP="${UESP:+$UESP,}ue$k:${IPS[$k]}"; done
               BEN=""; for k in $(seq $(( NB_ATT + 1 )) "$NUE"); do BEN="${BEN:+$BEN,}ue$k:${IPS[$k]}"; done
+              # UE bénin de référence (le premier) : trafic et RTT de scenario.py, comme dans __9_ (port 5200+k) ;
+              # les autres UE bénins : trafics variés de trafic_benin.py. Un seul générateur par UE et par port.
+              BEN_REF="${BEN%%,*}"; BEN_AUTRES=""; [ "$BEN" != "$BEN_REF" ] && BEN_AUTRES="${BEN#*,}"
               echo "$RUN : attaquants=$UESP bénins=$BEN" | tee -a "$LOGS/63_ues_par_politique.txt"
 
               # xApp de décision
@@ -3312,14 +3336,16 @@ jobs:
               DSPID=$!
               sleep 3
 
-              # trafic bénin varié sur les UE bénins (+ flash crowd pour le scénario flash)
-              if [ -n "$BEN" ]; then
-                FLASH=""; [ "$SC" = flash ] && FLASH="--flash ue$(( NB_ATT + 1 )):12:15:12M"
-                sudo setsid nohup python3 trafic_benin.py --ues "$BEN" --total 55 $FLASH --events "$LOGS/69_benin_$RUN.jsonl" > "$LOGS/69_benin_${RUN}.log" 2>&1 < /dev/null &
+              # trafic bénin varié : sur les UE bénins autres que la référence ; pour flash (sans scenario.py), sur
+              # tous les UE bénins, et le premier passe brusquement à haut débit (flash crowd)
+              TB_UES="$BEN_AUTRES"; FLASH=""
+              [ "$SC" = flash ] && { TB_UES="$BEN"; FLASH="--flash ue$(( NB_ATT + 1 )):12:15:12M"; }
+              if [ -n "$TB_UES" ]; then
+                sudo setsid nohup python3 trafic_benin.py --ues "$TB_UES" --total 55 $FLASH --events "$LOGS/69_benin_$RUN.jsonl" > "$LOGS/69_benin_${RUN}.log" 2>&1 < /dev/null &
               fi
-              # attaque (ou rien pour flash) ; scenario.py écrit aussi la QoS de l'UE bénin ue(NB_ATT+1)
+              # attaque (ou rien pour flash) ; scenario.py fait aussi le trafic et la sonde RTT de l'UE bénin de référence
               if [ -n "$ATKS" ]; then
-                sudo python3 scenario.py --ues "$UESP${BEN:+,$BEN}" --attacks "$ATKS" --total 55 --events "$LOGS/62_ev_$RUN.jsonl" 2>&1 | tee "$LOGS/62_scenario_$RUN.log"
+                sudo python3 scenario.py --ues "$UESP${BEN_REF:+,$BEN_REF}" --attacks "$ATKS" --total 55 --events "$LOGS/62_ev_$RUN.jsonl" 2>&1 | tee "$LOGS/62_scenario_$RUN.log"
               else
                 printf '[]\n' > "$LOGS/62_ev_$RUN.jsonl"; sleep "$DUREE_ATTAQUE"   # flash : pas d'attaque
               fi
