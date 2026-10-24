@@ -16,11 +16,11 @@ on:
         description: "Scenario d'attaque de ce lancement : udp, syn, multi ou flash (un par lancement)"
         default: "udp"
       politiques:
-        description: "Politiques a comparer"
-        default: "xml5g xml5g_filtre tsourdinis throttle xml5g_persist immediate slice none"
+        description: "Politiques (groupe A par defaut ; groupe B = xml5g xml5g_filtre xml5g_persist immediate slice)"
+        default: "xml5g tsourdinis throttle none"
       nb_benins:
-        description: "Nombre d'UE benins en plus du ou des attaquants"
-        default: "2"
+        description: "Nombre d'UE benins en plus du ou des attaquants (1 = comme __9_ ; plus surcharge la machine)"
+        default: "1"
       essais:
         description: "Essais valides vises par (scenario, politique)"
         default: "5"
@@ -44,8 +44,8 @@ jobs:
       WORK: /home/runner/xml5g
       LOGS: /home/runner/xml5g-journaux
       SCENARIOS: ${{ github.event.inputs.scenarios || 'udp' }}
-      POLITIQUES: ${{ github.event.inputs.politiques || 'xml5g xml5g_filtre tsourdinis throttle xml5g_persist immediate slice none' }}
-      NB_BENINS: ${{ github.event.inputs.nb_benins || '2' }}
+      POLITIQUES: ${{ github.event.inputs.politiques || 'xml5g tsourdinis throttle none' }}
+      NB_BENINS: ${{ github.event.inputs.nb_benins || '1' }}
       ESSAIS: ${{ github.event.inputs.essais || '5' }}
       KPM_POLITIQUES: ${{ github.event.inputs.kpm || 'none' }}
       MODE_TEST: ${{ github.event.inputs.mode_test || 'oui' }}
@@ -1232,10 +1232,37 @@ jobs:
               ap.add_argument("--verite", default="udp:5555,tcp:80",
                               help="paquets de vérité terrain « attaque » : protocole:port_destination, séparés par des virgules")
               ap.add_argument("--pktlog", default="", help="journal compressé des paquets (.csv.gz)")
+              ap.add_argument("--attente-xapp", type=float, default=20.0,
+                              help="secondes d'attente maximale de la xApp (mode detect)")
               a = ap.parse_args()
 
               PROTO = {"udp": 17, "tcp": 6}
               verite = {(PROTO[x.split(":")[0]], int(x.split(":")[1])) for x in a.verite.split(",") if ":" in x}
+              model, conn, seuil = None, None, 0.5
+              if a.mode == "detect":
+                  import joblib
+                  charge = joblib.load(a.model)
+                  if isinstance(charge, dict):          # modèle + seuil réglé sous budget de fausses alarmes
+                      model, seuil = charge["modele"], float(charge["seuil"])
+                  else:
+                      model, seuil = charge, 0.5
+                  print(f"modèle : {charge.get('algorithme', type(model).__name__) if isinstance(charge, dict) else type(model).__name__}, "
+                        f"seuil {seuil:.4f}", flush=True)
+                  # Le modèle est chargé AVANT que la plateforme ne soit chargée (le workflow lance le détecteur
+                  # avant le gNB) : sous charge, l'import de XGBoost prenait jusqu'à 2 min. Le détecteur attend
+                  # ensuite la xApp jusqu'à --attente-xapp secondes.
+                  h, p = a.xapp.split(":")
+                  fin_attente = time.time() + a.attente_xapp
+                  while time.time() < fin_attente:
+                      try:
+                          conn = socket.create_connection((h, int(p)), timeout=2)
+                          break
+                      except OSError:
+                          time.sleep(0.5)
+                  if conn is None:
+                      print("xApp injoignable", file=sys.stderr)
+              # La capture commence APRÈS le chargement du modèle et la connexion à la xApp : sinon la file du
+              # noyau se remplirait de paquets anciens pendant l'attente.
               upf = socket.inet_aton(a.upf)
               s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
               s.bind((a.iface, 0))
@@ -1258,26 +1285,6 @@ jobs:
               fprog = struct.pack("HL", len(bpf), ctypes.addressof(cbuf))
               s.setsockopt(socket.SOL_SOCKET, 26, fprog)          # 26 = SO_ATTACH_FILTER
               s.settimeout(0.05)
-
-              model, conn, seuil = None, None, 0.5
-              if a.mode == "detect":
-                  import joblib
-                  charge = joblib.load(a.model)
-                  if isinstance(charge, dict):          # modèle + seuil réglé sous budget de fausses alarmes
-                      model, seuil = charge["modele"], float(charge["seuil"])
-                  else:
-                      model, seuil = charge, 0.5
-                  print(f"modèle : {charge.get('algorithme', type(model).__name__) if isinstance(charge, dict) else type(model).__name__}, "
-                        f"seuil {seuil:.4f}", flush=True)
-                  h, p = a.xapp.split(":")
-                  for _ in range(100):
-                      try:
-                          conn = socket.create_connection((h, int(p)), timeout=2)
-                          break
-                      except OSError:
-                          time.sleep(0.2)
-                  if conn is None:
-                      print("xApp injoignable", file=sys.stderr)
               out = open(a.out, "w")
               if a.mode == "collect":
                   out.write("t,teid,ip," + ",".join(FEATURES) + ",n_marques\n")
@@ -3163,9 +3170,13 @@ jobs:
           # Entrées (workflow_dispatch), avec valeurs par défaut tenables sur un runner GitHub (4 cœurs).
           NVALIDE="${ESSAIS:-5}"                       # essais valides visés par (scénario, politique)
           MAX_ESSAIS="${MAX_ESSAIS:-8}"
-          NB_BENINS="${NB_BENINS:-2}"                  # UE bénins en plus du ou des attaquants
+          # 1 UE bénin par défaut, comme __9_ : avec un 3e UE (lancement udp du 24/10), les fils temps réel d'OAI
+          # privaient le détecteur de processeur, il mettait jusqu'à 2 min à démarrer et 21 essais sur 33 ont été perdus
+          NB_BENINS="${NB_BENINS:-1}"                  # UE bénins en plus du ou des attaquants
           SCENARIOS="${SCENARIOS:-udp syn multi flash}"
-          POLITIQUES="${POLITIQUES:-xml5g xml5g_filtre tsourdinis throttle xml5g_persist immediate slice none}"
+          # un essai dure environ 6 min : 8 politiques x 5 essais ne tiennent pas dans un job ; deux groupes par
+          # scénario (A par défaut ; B = « xml5g xml5g_filtre xml5g_persist immediate slice »), xml5g dans les deux
+          POLITIQUES="${POLITIQUES:-xml5g tsourdinis throttle none}"
           DUREE_ATTAQUE="${DUREE_ATTAQUE:-40}"
           LIMITE_THROTTLE="${LIMITE_THROTTLE:-512kbit}"
           KPM_POLITIQUES="${KPM_POLITIQUES:-none}"     # politiques pendant lesquelles les KPM sont enregistrés (M4)
@@ -3181,7 +3192,15 @@ jobs:
           arreter_ran() {
             sudo pkill -f nr-uesoftmodem; sudo pkill -f nr-softmodem
             sudo pkill -f nearRT-RIC; sudo pkill -f xapp_kpm_moni
+            sudo pkill -f "ids_xml5g.py --mode detect"
             sleep 5
+          }
+          lancer_detecteur() {   # avant le gNB : le modèle se charge sur une machine encore peu chargée
+            sudo -E setsid nohup nice -n -10 stdbuf -oL python3 ids_xml5g.py --mode detect --iface oai-cn5g --upf 192.168.70.134 \
+              --bin 0.2 --duration 80 --min-pkts "$IDS_MIN" --model "$WORK/model.joblib" --xapp 127.0.0.1:9999 --attente-xapp 900 \
+              --out "$LOGS/61_ids_$RUN.log" --summary "$LOGS/61_ids_${RUN}_summary.json" --pktlog "$LOGS/68_pkt_$RUN.csv.gz" \
+              > "$LOGS/61_ids_${RUN}_run.log" 2>&1 < /dev/null &
+            IDSPID=$!
           }
           demarrer_ran() {   # $1 = étiquette de journal ; $2 = nombre d'UE à lancer
             local tag=$1 nue=$2
@@ -3257,6 +3276,7 @@ jobs:
           for SC in $SCENARIOS; do
             attaques_du_scenario "$SC"
             NUE=$(( NB_ATT + NB_BENINS ))
+            [ "$SC" = flash ] && NUE=$(( NB_BENINS + 1 ))   # flash : autant d'UE que udp (un UE passe en flash crowd)
             [ "$NUE" -gt 9 ] && NUE=9
             bash "$WORK/py/provisionner_abonnes.sh" "$NUE" >> "$LOGS/13_abonnes.txt" 2>&1
             for POL in $POLITIQUES; do
@@ -3273,6 +3293,7 @@ jobs:
                 # cœur sain avant de connecter les UE ; à la 2e tentative, tout le cœur (sauf la base) est recréé
                 if [ "$tentative" = 1 ]; then reparer_coeur "${RUN}_t1"; else reparer_coeur "${RUN}_t2" complet; fi
                 case " $REPARES " in *" mysql "*) bash "$WORK/py/provisionner_abonnes.sh" "$NUE" >> "$LOGS/13_abonnes.txt" 2>&1 ;; esac
+                lancer_detecteur; sleep 20     # chargement du modèle avant que le gNB et les UE n'occupent la machine
                 demarrer_ran "$RUN" "$NUE"; poser_goulot
                 ok=1; IPS=()
                 for k in $(seq 1 "$NUE"); do
@@ -3309,7 +3330,7 @@ jobs:
               echo "$RUN : attaquants=$UESP bénins=$BEN" | tee -a "$LOGS/63_ues_par_politique.txt"
 
               # xApp de décision
-              eval "$POL_ENV XML5G_W=10 XML5G_THETA=0.7 XML5G_DURATION=80 XML5G_PORT=9999 \
+              eval "$POL_ENV XML5G_W=10 XML5G_THETA=0.7 XML5G_DURATION=90 XML5G_PORT=9999 \
                 sudo -E setsid nohup nice -n -10 stdbuf -oL \"$FR/examples/xApp/c/xapp_xml5g/xapp_xml5g\" -c \"$FR_CONF\" -p \"$SM_DIR/\" > \"$LOGS/60_xapp_$RUN.log\" 2>&1 < /dev/null &"
               XPID=$!
               # xApp KPM (remarque M4) : rapports E2SM-KPM par UE (débit, PRB, volume PDCP, délai RLC ; style 4,
@@ -3322,13 +3343,17 @@ jobs:
                 *" $POL "*|*" tout "*)
                   sudo -E setsid nohup bash -c "XAPP_DURATION=100 stdbuf -oL '$FR/examples/xApp/c/monitor/xapp_kpm_moni' -c '$FR_CONF' -p '$SM_DIR/' 2>&1 | python3 -u '$WORK/py/horodater.py'" > "$LOGS/67_kpm_$RUN.log" 2>&1 < /dev/null & ;;
               esac
-              sleep 8
-              # détecteur (avec vérité terrain par ports, journal de paquets, filtre éventuel)
-              sudo -E setsid nohup nice -n -10 stdbuf -oL python3 ids_xml5g.py --mode detect --iface oai-cn5g --upf 192.168.70.134 \
-                --bin 0.2 --duration 70 --min-pkts "$IDS_MIN" --model "$WORK/model.joblib" --xapp 127.0.0.1:9999 \
-                --out "$LOGS/61_ids_$RUN.log" --summary "$LOGS/61_ids_${RUN}_summary.json" --pktlog "$LOGS/68_pkt_$RUN.csv.gz" \
-                > "$LOGS/61_ids_${RUN}_run.log" 2>&1 < /dev/null &
-              IDSPID=$!
+              # Le détecteur, lancé avant le gNB, attend la xApp et se connecte dès qu'elle écoute. Sa capture de 80 s
+              # commence à la connexion (10 s de plus que __9_ : le trafic montant arrive au N3 avec retard).
+              # Sans connexion en 60 s, l'essai est abandonné : rien n'y serait mesuré.
+              for i in $(seq 1 30); do grep -q "détecteur connecté" "$LOGS/60_xapp_$RUN.log" 2>/dev/null && break; sleep 2; done
+              if ! grep -q "détecteur connecté" "$LOGS/60_xapp_$RUN.log" 2>/dev/null; then
+                echo "$RUN invalide detecteur_non_connecte" >> "$LOGS/63_validite.txt"
+                sudo kill $XPID 2>/dev/null; sudo pkill -TERM -f "xapp_kpm_moni -c" 2>/dev/null
+                sudo pkill -f "ids_xml5g.py --mode detect"; sleep 2; sudo rm -f /tmp/xapp_db_* 2>/dev/null
+                continue
+              fi
+              sleep 5                          # correspondance tunnel -> UE apprise par la xApp (modèle GTP)
               sleep 2
               PIDS=$(pgrep -d, -f "ids_xml5g.py --mode detect|xapp_xml5g -c|xapp_kpm_moni -c|nr-softmodem|nr-uesoftmodem")
               [ -n "$PIDS" ] && { pidstat -h -u -r -p "$PIDS" 1 > "$LOGS/65_pidstat_$RUN.txt" 2>&1 & echo $! > /tmp/pidstat.pid; }
@@ -3363,6 +3388,7 @@ jobs:
               # de __9_) ; pour flash, le trafic bénin doit avoir tourné ; sinon, l'attaque doit avoir été lancée
               valide=1; raison=""
               if grep -q "injoignable" "$LOGS/61_ids_${RUN}_run.log" 2>/dev/null; then valide=0; raison="xapp_injoignable"
+              elif ! grep -q "détecteur connecté" "$LOGS/60_xapp_$RUN.log" 2>/dev/null; then valide=0; raison="detecteur_non_connecte"
               elif [ "$SC" = flash ]; then [ -s "$LOGS/69_benin_$RUN.jsonl" ] || { valide=0; raison="trafic_benin_absent"; }
               else grep -q '"start"' "$LOGS/62_ev_$RUN.jsonl" 2>/dev/null || { valide=0; raison="attaque_non_lancee"; }
               fi
