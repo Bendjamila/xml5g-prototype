@@ -13,8 +13,8 @@ on:
   workflow_dispatch:
     inputs:
       scenarios:
-        description: "Scenarios d'attaque, separes par des espaces (udp syn multi flash)"
-        default: "udp syn multi flash"
+        description: "Scenario d'attaque de ce lancement : udp, syn, multi ou flash (un par lancement)"
+        default: "udp"
       politiques:
         description: "Politiques a comparer"
         default: "xml5g xml5g_filtre tsourdinis throttle xml5g_persist immediate slice none"
@@ -28,8 +28,8 @@ on:
         description: "Politiques pendant lesquelles les KPM sont enregistres (M4), ou tout"
         default: "none"
       mode_test:
-        description: "oui = essai rapide de la chaine (un seul cas), non = campagne complete"
-        default: "non"
+        description: "oui = essai rapide de la chaine (1 h), non = campagne de ce scenario"
+        default: "oui"
 
 permissions:
   contents: read
@@ -43,12 +43,12 @@ jobs:
       FLEXRIC_COMMIT: d7a71285f3720fbc1487e9a86309eec5fb61a408
       WORK: /home/runner/xml5g
       LOGS: /home/runner/xml5g-journaux
-      SCENARIOS: ${{ github.event.inputs.scenarios || 'udp syn multi flash' }}
+      SCENARIOS: ${{ github.event.inputs.scenarios || 'udp' }}
       POLITIQUES: ${{ github.event.inputs.politiques || 'xml5g xml5g_filtre tsourdinis throttle xml5g_persist immediate slice none' }}
       NB_BENINS: ${{ github.event.inputs.nb_benins || '2' }}
       ESSAIS: ${{ github.event.inputs.essais || '5' }}
       KPM_POLITIQUES: ${{ github.event.inputs.kpm || 'none' }}
-      MODE_TEST: ${{ github.event.inputs.mode_test || 'non' }}
+      MODE_TEST: ${{ github.event.inputs.mode_test || 'oui' }}
     defaults:
       run:
         shell: bash
@@ -1662,10 +1662,16 @@ jobs:
           for l in lire("63_validite.txt").splitlines():
               f = l.split()
               if len(f) >= 2: VALIDITE[f[0]] = (f[1] == "valide", " ".join(f[2:]))
-          UES_RUN = {}
+          # UE de chaque essai. Deux formats : « RUN : ue1:ip,ue2:ip » (__9_) et, en phase 3,
+          # « RUN : attaquants=ue1:ip bénins=ue2:ip,ue3:ip ». BENINS_RUN garde l'ordre des UE bénins : le premier est
+          # l'UE bénin de référence, celui dont scenario.py mesure le débit et le RTT.
+          UES_RUN, BENINS_RUN = {}, {}
           for l in lire("63_ues_par_politique.txt").splitlines():
               run, _, v = l.partition(" : ")
-              UES_RUN[run.strip()] = dict(x.split(":") for x in v.strip().split(",") if ":" in x)
+              UES_RUN[run.strip()] = dict(re.findall(r"(ue\d+):(\d+(?:\.\d+){3})", v))
+              mb = re.search(r"b\S*nins=(\S*)", v)
+              if mb:
+                  BENINS_RUN[run.strip()] = re.findall(r"(ue\d+):", mb.group(1))
           def upf_pps(ip, t0, a, b):
               """paquets montants par seconde de l'UE à l'UPF, en moyenne sur [t0+a, t0+b) (secondes sans paquet = 0)."""
               ser = UPF.get(ip, {})
@@ -1730,20 +1736,30 @@ jobs:
               x = lire(f"60_xapp_{R}.log")
               if not x: return None
               s = js(f"61_ids_{R}_summary.json")
-              ev = [json.loads(l) for l in lire(f"62_ev_{R}.jsonl").splitlines() if l.strip()]
-              e = ev[0] if ev else None
+              ev = []
+              for l in lire(f"62_ev_{R}.jsonl").splitlines():
+                  try:
+                      j = json.loads(l)
+                  except ValueError:
+                      continue
+                  ev += [d for d in (j if isinstance(j, list) else [j]) if isinstance(d, dict) and not d.get("benign")]
+              e = ev[0] if ev else None          # premier attaquant : référence des délais
               ul = {int(t): u for t, u in RE_MAP.findall(x)}
-              atk_ue = None
-              if e:
+
+              def ue_de(ip):
                   for teid, d in (s or {}).items():
-                      if d.get("ip") == e["ip"] and (int(teid) & 0xFF) in ul:
-                          atk_ue = ul[int(teid) & 0xFF]
+                      if teid != "_boucle" and isinstance(d, dict) and d.get("ip") == ip and (int(teid) & 0xFF) in ul:
+                          return ul[int(teid) & 0xFF]
+                  return None
+              atk_ue = ue_de(e["ip"]) if e else None
+              atk_tous = {u for u in (ue_de(d["ip"]) for d in ev) if u is not None}   # scénario multi : tous les attaquants
               summ = {u: dict(v=int(v), a=int(al)) for u, v, al, _ in RE_SUM.findall(x)}
               o_throttle = [m for m in re.findall(r"THROTTLE ran_ue_id=(\d+) ip=(\S+) .* result=(-?\d+)", x)]
               o_persist = [m for m in re.findall(r"PERSIST ran_ue_id=(\d+) ip=(\S+) .* result=(-?\d+)", x)]
               mm = re.search(r"unmapped_verdicts=(\d+)", x)
               o = dict(politique=pol, scenario=scen or "udp", rep=r, verdicts=sum(v["v"] for v in summ.values()),
                        non_associes=int(mm.group(1)) if mm else None, attaquant_libere=0, benins_liberes=0,
+                       n_attaquants=len(ev), attaquants_liberes=0,
                        alarme_vers_commande_ms=None, decision_vers_ack_ms=None, debut_vers_liberation_s=None,
                        debut_vers_1re_alarme_s=None, debut_vers_flood_upf_s=None,
                        regle_sur_attaquant=0, regle_sur_benins=0,
@@ -1759,17 +1775,19 @@ jobs:
               t0 = e["start"]; fin = e["end"] - t0
               for u, al, dec, se, ak, res in RE_REL.findall(x):
                   if res != "ACK": continue
+                  if u in atk_tous:
+                      o["attaquants_liberes"] += 1
                   if atk_ue is not None and u == atk_ue:
                       o["attaquant_libere"] = 1
                       o["alarme_vers_commande_ms"] = round((int(se) - int(al)) / 1e3, 1) if int(al) else None
                       o["decision_vers_ack_ms"] = round((int(ak) - int(dec)) / 1e3, 2)
                       o["debut_vers_liberation_s"] = round(int(ak) / 1e6 - t0, 2)
                       o["debut_vers_1re_alarme_s"] = round(int(al) / 1e6 - t0, 2) if int(al) else None
-                  else:
+                  elif u not in atk_tous:
                       o["benins_liberes"] += 1
               for u in re.findall(r"WOULD_RELEASE ran_ue_id=(\d+)", x):
                   if atk_ue is not None and u == atk_ue: o["regle_sur_attaquant"] = 1
-                  else: o["regle_sur_benins"] += 1
+                  elif u not in atk_tous: o["regle_sur_benins"] += 1
               # verdicts du détecteur : attaquant dans la fenêtre d'attaque, UE bénin partout
               a_n = a_p = b_n = b_p = 0; t_al = None
               for l in lire(f"61_ids_{R}.log").splitlines():
@@ -1815,7 +1833,8 @@ jobs:
                       if ser.get(int(t0) + k, 0) >= seuil:
                           o["debut_vers_flood_upf_s"] = k; break
               # qualité de service de l'UE bénin (l'autre UE)
-              ns_b = "ue2" if e.get("ns") == "ue1" else "ue1"
+              ben = BENINS_RUN.get(R)
+              ns_b = ben[0] if ben else ("ue2" if e.get("ns") == "ue1" else "ue1")
               port_b = 5200 + int(ns_b[2:])
               # Qualité de service de l'UE bénin : MÊMES fenêtres pour toutes les politiques (sinon la comparaison
               # est biaisée) : avant [-9, 0), pendant toute l'attaque [0, 40), seconde moitié de l'attaque [20, 40),
@@ -1877,7 +1896,7 @@ jobs:
               return [o.get(k) for o in RUNS if o["politique"] == p and (scen is None or o.get("scenario") == scen)]
           SCENS = sorted({o.get("scenario", "udp") for o in RUNS})
 
-          md = ["## xML5G — phase 2, campagne finale : bilan", "",
+          md = ["## xML5G — phase 3 (réponse au rapport d'expertise) : bilan", "",
                 "### Plateforme", "", "- " + ", ".join(f"{k} = {v}" for k, v in etat.items()), ""]
           md += ["### Détecteur (entraîné sur le trafic de la plateforme)", ""]
           if train:
@@ -2752,6 +2771,95 @@ jobs:
           if __name__ == "__main__":
               main()
           M4_EOF
+          cat > "$WORK/py/coeur.sh" <<'COEUR_EOF'
+          # xML5G phase 3 — santé du cœur 5G (fichier sourcé par les étapes 7, 10 et 11).
+          #
+          # Lancement du 23/10/2026 : le SMF s'est figé environ 3 min après le démarrage du cœur, juste après une
+          # réponse de battement PFCP (plus aucune ligne de journal, plus de battement vers l'UPF ni vers le NRF).
+          # Le NRF l'a alors retiré, l'AMF ne trouvait plus de SMF (« SMF Selection, no SMF candidate is
+          # available »), aucun UE n'obtenait d'adresse, le détecteur n'a pas pu être entraîné et la boucle a
+          # consommé son budget en tentatives vaines. Le même gel du SMF existe dans la campagne __9_ (287 s de
+          # silence au même endroit), mais il était survenu après l'établissement des sessions.
+          # Ces fonctions repèrent un NF arrêté ou figé AVANT de connecter des UE, le recréent, et enregistrent
+          # l'état des conteneurs et du noyau pour le diagnostic (14_coeur_*.txt).
+          CN_DIR="${CN_DIR:-$WORK/oai/doc/tutorial_resources/oai-cn5g}"
+          NF_COEUR="mysql oai-nrf oai-udr oai-udm oai-ausf oai-amf oai-smf oai-upf oai-ext-dn"
+          NF_BAVARDS="oai-amf oai-smf oai-upf"   # journalisent au moins toutes les 10 s (battements NRF et PFCP)
+          NF_COMPLET="oai-nrf oai-udr oai-udm oai-ausf oai-amf oai-smf oai-upf"   # tout sauf la base et le DN
+
+          etat_coeur() {   # $1 = étiquette : état de chaque conteneur, activité des journaux, noyau, mémoire
+            local c
+            {
+              date -u +%FT%TZ
+              for c in $NF_COEUR; do
+                docker inspect -f "$c {{.State.Status}} sante={{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}} code={{.State.ExitCode}} oom={{.State.OOMKilled}} erreur={{.State.Error}} debut={{.State.StartedAt}} fin={{.State.FinishedAt}} redemarrages={{.RestartCount}}" "$c" 2>&1
+              done
+              for c in $NF_BAVARDS; do
+                echo "$c : lignes de journal sur les 60 dernières s = $(docker logs --since 60s "$c" 2>&1 | wc -l)"
+              done
+              echo "--- noyau (oom, segfault)"
+              sudo dmesg -T 2>/dev/null | grep -iE "oom|killed process|segfault|out of memory" | tail -20
+              echo "--- mémoire"
+              free -m
+            } > "$LOGS/14_coeur_$1.txt" 2>&1
+          }
+
+          nf_en_panne() {  # écrit la liste des NF arrêtés, ou figés (aucune ligne de journal depuis 40 s)
+            local c st out=""
+            for c in $NF_COEUR; do
+              st=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null)
+              if [ "$st" != running ]; then out="$out $c"; continue; fi
+              case " $NF_BAVARDS " in
+                *" $c "*) [ "$(docker logs --since 40s "$c" 2>&1 | head -c 1 | wc -c)" -gt 0 ] || out="$out $c" ;;
+              esac
+            done
+            echo $out
+          }
+
+          reparer_coeur() {   # $1 = étiquette ; $2 = « complet » pour tout recréer sauf la base et le DN.
+            # Renvoie 0 si le cœur est sain (tel quel ou réparé), 1 sinon. REPARES = NF recréés (vide si rien).
+            # À appeler seulement quand aucun UE n'est connecté (avant le gNB, ou avant le redémarrage du RAN) :
+            # l'appelant relance ensuite ce qui en dépend (gNB et UE, goulot sur l'UPF, abonnés si la base change).
+            if [ "$2" = complet ]; then REPARES="$NF_COMPLET $(nf_en_panne)"; else REPARES=$(nf_en_panne); fi
+            [ -z "$REPARES" ] && return 0
+            case " $REPARES " in        # SMF et UPF vont ensemble : un SMF neuf face à un UPF qui garde d'anciennes
+              *" oai-smf "*|*" oai-upf "*) REPARES="$REPARES oai-smf oai-upf" ;;   # sessions PFCP, ou l'inverse,
+            esac                                                                   # donnerait des sessions orphelines
+            case " $REPARES " in *" oai-nrf "*) REPARES="$REPARES $NF_COMPLET" ;; esac   # tous se réenregistrent
+            case " $REPARES " in *" mysql "*) REPARES="$REPARES oai-udr" ;; esac
+            local c u=""
+            for c in $NF_COEUR; do case " $REPARES " in *" $c "*) u="$u $c" ;; esac; done   # sans doublon, dans l'ordre
+            REPARES=$(echo $u)
+            echo "::warning::cœur 5G : recréation de $REPARES [$1]"
+            etat_coeur "$1"
+            for c in oai-amf oai-smf oai-upf oai-nrf; do   # la recréation efface le journal du conteneur : on le garde
+              case " $REPARES " in *" $c "*) docker logs "$c" > "$LOGS/41_${c}_avant_$1.log" 2>&1 ;; esac
+            done
+            ( cd "$CN_DIR" && docker compose up -d --force-recreate --no-deps $REPARES ) >> "$LOGS/14_coeur_$1.txt" 2>&1
+            local i sain
+            for i in $(seq 1 24); do          # au plus 2 min pour que les NF recréés soient « healthy »
+              sleep 5; sain=1
+              for c in $REPARES; do
+                case "$(docker inspect -f '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}healthy{{end}}' "$c" 2>/dev/null)" in
+                  running/healthy) ;;
+                  *) sain=0 ;;
+                esac
+              done
+              [ "$sain" = 1 ] && break
+            done
+            case " $REPARES " in            # un UPF neuf n'a peut-être pas tc (goulot) : même installation qu'à l'étape 7
+              *" oai-upf "*) docker exec oai-upf sh -c "command -v tc >/dev/null 2>&1" || docker exec oai-upf sh -c "(apt-get update && apt-get install -y iproute2) >/dev/null 2>&1 || (apk add --no-cache iproute2) >/dev/null 2>&1" ;;
+            esac
+            sleep 15                          # enregistrement auprès du NRF, association PFCP SMF-UPF
+            if [ -z "$(nf_en_panne)" ]; then
+              echo "coeur_repare=$(echo $REPARES | tr ' ' ',') ($1)" >> "$LOGS/09_etapes.txt"
+              return 0
+            fi
+            echo "coeur_irreparable=$(nf_en_panne | tr ' ' ',') ($1)" >> "$LOGS/09_etapes.txt"
+            echo "::error::cœur 5G toujours en panne après recréation ($(nf_en_panne)) [$1]"
+            return 1
+          }
+          COEUR_EOF
           cat > "$WORK/py/limiter_ue.sh" <<'LIM_EOF'
           #!/bin/bash
           # xML5G phase 3 - action graduée (politique throttle) : limite le débit montant de l'UE d'adresse $1.
@@ -2902,6 +3010,10 @@ jobs:
           fi
           echo "profil_radio=$PROFIL" >> "$LOGS/09_etapes.txt"
           echo "GNB_CONF=$GNB_CONF" >> "$GITHUB_ENV"; echo "UE_RF=$UE_RF" >> "$GITHUB_ENV"
+          # santé du cœur 5G avant de connecter les UE (coeur.sh)
+          . "$WORK/py/coeur.sh"
+          reparer_coeur avant_gnb
+          case " $REPARES " in *" oai-ext-dn "*) for P in 5201 5202; do docker exec -d oai-ext-dn iperf3 -s -p $P > /dev/null 2>&1; done ;; esac
           lancer_gnb "$GNB_CONF" "" || echo "::error::le gNB ne s'attache pas à l'AMF ou au RIC"
           mkdir -p "$WORK"
           cat > "$WORK/goulot.sh" <<'GOULOT_SH'
@@ -2932,6 +3044,7 @@ jobs:
             echo "::warning::goulot INACTIF - verifier le nom d'interface UPF"; echo "goulot_verifie=non" >> "$LOGS/09_etapes.txt"
             docker exec oai-upf sh -c "ip -o link; echo ---QDISC---; tc qdisc show; echo ---IFB0---; tc -s qdisc show dev ifb0 2>&1; echo ---ERR---; cat /tmp/tcerr 2>/dev/null" > "$LOGS/07_upf_interfaces.txt" 2>&1 || true
           fi
+          connecter_ues() {   # boucle d'origine, mise en fonction pour pouvoir la rejouer
           UES=""
           for k in 1 2; do
             creer_ue $k
@@ -2972,11 +3085,25 @@ jobs:
             [ -n "$ip_ue" ] && UES="${UES:+$UES,}ue$k:$ip_ue"
             sleep 20
           done
+          }
+          connecter_ues
+          if [ "$(echo "$UES" | tr ',' '\n' | grep -c .)" -lt 2 ]; then
+            # seconde chance : tout le cœur (sauf la base) recréé, gNB et UE relancés
+            echo "::warning::UE non connectés : recréation du cœur 5G et nouvel essai"
+            etat_coeur ues_etape7_essai1
+            sudo pkill -f nr-uesoftmodem; sudo pkill -f nr-softmodem; sleep 5
+            reparer_coeur ues_etape7 complet
+            lancer_gnb "$GNB_CONF" "" || echo "::error::le gNB ne s'attache pas à l'AMF ou au RIC"
+            poser_goulot
+            sed -i '/^ue[12]_\(ip\|ping\)=/d' "$LOGS/09_etapes.txt"; echo "ues_seconde_chance=oui" >> "$LOGS/09_etapes.txt"
+            connecter_ues
+          fi
           echo "UES=$UES" >> "$GITHUB_ENV"
           echo "les deux UEs : $UES"
           n_ue=$(echo "$UES" | tr ',' '\n' | grep -c . )
           echo "nb_ue=$n_ue" >> "$LOGS/09_etapes.txt"
           [ "$n_ue" -eq 2 ] || echo "::error::seulement $n_ue UE(s) connecté(s) sur 2 : la suite ne peut pas fonctionner"
+          [ "$n_ue" -eq 2 ] || etat_coeur fin_etape7
       - name: 8. Collecte du trafic d'entraînement (2 sessions)
         continue-on-error: true
         run: |
@@ -3019,7 +3146,15 @@ jobs:
           # Ce bloc remplace l'étape 10 de phaseF2.yml. Extrait ici pour « bash -n » ; dans le YAML il
           # tourne avec $WORK, $B, $FR, $GNB_CONF, $UE_RF, $SM_DIR, $FR_CONF, $LOGS déjà définis.
           set +e +o pipefail
-          [ -f "$WORK/model.joblib" ] || echo "::error::pas de modèle : la boucle tournera sans détecteur"
+          . "$WORK/py/coeur.sh"        # santé du cœur 5G : etat_coeur, reparer_coeur (gel du SMF du 23/10)
+          if [ ! -f "$WORK/model.joblib" ]; then
+            # Sans détecteur, aucun essai ne mesure quoi que ce soit : on s'arrête tout de suite au lieu de
+            # consommer le budget (lancement du 23/10 : 3 h 30 de tentatives vaines).
+            echo "::error::pas de détecteur entraîné (UE non connectés aux étapes 7-8 : voir 09_etapes.txt et 14_coeur_*.txt). Campagne annulée."
+            echo "campagne=annulee_sans_detecteur" >> "$LOGS/09_etapes.txt"
+            etat_coeur sans_detecteur
+            exit 0
+          fi
           cd "$WORK/py"
           B="$WORK/oai/cmake_targets/ran_build/build"
           FR="$WORK/oai/openair2/E2AP/flexric/build"
@@ -3064,17 +3199,24 @@ jobs:
             done
           }
           ue_pret() {   # $1 = k ; renvoie l'adresse de l'UE (vide si échec), garantit route + ping
-            local k=$1 ip_ tun
-            for essai in 1 2 3; do
-              ip_=$(sudo ip netns exec ue$k ip -o -4 addr show 2>/dev/null | awk '/oaitun/{split($4,a,"/"); print a[1]; exit}')
+            # On ATTEND d'abord l'adresse de l'UE qui vient d'être lancé (jusqu'à 2 min) avant de le relancer :
+            # le relancer aussitôt l'interrompait en pleine procédure d'enregistrement.
+            local k=$1 ip_ tun essai i
+            for essai in 1 2; do
+              for i in $(seq 1 40); do
+                ip_=$(sudo ip netns exec ue$k ip -o -4 addr show 2>/dev/null | awk '/oaitun/{split($4,a,"/"); print a[1]; exit}')
+                [ -n "$ip_" ] && break
+                pgrep -f "ue$k.conf" > /dev/null || break          # le processus de l'UE est mort
+                sleep 3
+              done
               if [ -n "$ip_" ]; then
                 tun=$(sudo ip netns exec ue$k ip -o -4 addr show | awk '/oaitun/{print $2; exit}')
                 sudo ip netns exec ue$k ip route replace 192.168.70.0/24 dev "$tun"
                 if sudo ip netns exec ue$k ping -c 2 -W 2 192.168.70.135 > /dev/null 2>&1; then echo "$ip_"; return; fi
               fi
-              sudo pkill -f "ue$k.conf"; sleep 5
+              [ "$essai" = 2 ] && break
+              sudo pkill -f "ue$k.conf"; sleep 10
               sudo setsid nohup stdbuf -oL -eL ip netns exec ue$k "$B/nr-uesoftmodem" -O "$WORK/ue$k.conf" $UE_RF --rfsim '--rfsimulator.[0].serveraddr' "10.20$k.1.100" >> "$LOGS/12_ue$k.log" 2>&1 < /dev/null &
-              for i in $(seq 1 40); do sudo ip netns exec ue$k ip -o -4 addr show 2>/dev/null | grep -q oaitun && break; sleep 3; done
               sleep 5
             done
             echo ""
@@ -3096,8 +3238,10 @@ jobs:
             case "$1" in
               udp)   ATKS="ue1:udp:10:$DUREE_ATTAQUE"; NB_ATT=1 ;;
               syn)   ATKS="ue1:syn:10:$DUREE_ATTAQUE"; NB_ATT=1 ;;
-              multi) ATKS="ue1:udp:10:$DUREE_ATTAQUE,ue2:syn:10:$DUREE_ATTAQUE"; NB_ATT=2 ;;
-              flash) ATKS=""; NB_ATT=1 ;;   # pas d'attaque : flash crowd bénin seul (le pire cas pour la règle)
+              # deux attaquants SUCCESSIFS : scenario.py (inchangé) enchaîne ses attaques l'une après l'autre ;
+              # chacune dure la moitié de la fenêtre pour que les deux tiennent dans l'essai (55 s)
+              multi) ATKS="ue1:udp:10:$(( DUREE_ATTAQUE / 2 )),ue2:syn:$(( 10 + DUREE_ATTAQUE / 2 )):$(( DUREE_ATTAQUE / 2 ))"; NB_ATT=2 ;;
+              flash) ATKS=""; NB_ATT=0 ;;   # pas d'attaque, aucun attaquant : flash crowd bénin seul (le pire cas pour la règle)
             esac
           }
 
@@ -3105,6 +3249,7 @@ jobs:
           . "$WORK/goulot.sh"
           DEBUT=$(date +%s); BUDGET_S=$(( ${BUDGET_MIN:-200} * 60 ))   # compilation (~40 min) + boucle + bilan < 300 min
           : > "$LOGS/63_validite.txt"; : > "$LOGS/63_ues_par_politique.txt"
+          ECHECS_UE=0                  # essais consécutifs sans UE connecté (arrêt de la campagne à 2)
           declare -A NV NE
           for SC in $SCENARIOS; do for POL in $POLITIQUES; do NV[${SC}_${POL}]=0; NE[${SC}_${POL}]=0; done; done
 
@@ -3123,13 +3268,30 @@ jobs:
               options_politique "$POL"
 
               declare -a IPS; IPS=(); ok=1
-              for tentative in 1 2 3; do
-                arreter_ran; demarrer_ran "$RUN" "$NUE"; poser_goulot
+              for tentative in 1 2; do
+                arreter_ran
+                # cœur sain avant de connecter les UE ; à la 2e tentative, tout le cœur (sauf la base) est recréé
+                if [ "$tentative" = 1 ]; then reparer_coeur "${RUN}_t1"; else reparer_coeur "${RUN}_t2" complet; fi
+                case " $REPARES " in *" mysql "*) bash "$WORK/py/provisionner_abonnes.sh" "$NUE" >> "$LOGS/13_abonnes.txt" 2>&1 ;; esac
+                demarrer_ran "$RUN" "$NUE"; poser_goulot
                 ok=1; IPS=()
-                for k in $(seq 1 "$NUE"); do ip_=$(ue_pret "$k"); IPS[$k]="$ip_"; [ -z "$ip_" ] && ok=0; done
+                for k in $(seq 1 "$NUE"); do
+                  ip_=$(ue_pret "$k"); IPS[$k]="$ip_"
+                  [ -z "$ip_" ] && { ok=0; echo "$RUN : tentative $tentative, ue$k sans adresse"; break; }
+                done
                 [ "$ok" = 1 ] && break
               done
-              if [ "$ok" != 1 ]; then echo "$RUN invalide UE_non_connecte" >> "$LOGS/63_validite.txt"; continue; fi
+              if [ "$ok" != 1 ]; then
+                echo "$RUN invalide UE_non_connecte" >> "$LOGS/63_validite.txt"; etat_coeur "${RUN}_echec"
+                ECHECS_UE=$(( ECHECS_UE + 1 ))
+                if [ "$ECHECS_UE" -ge 2 ]; then
+                  echo "::error::2 essais de suite sans UE connecté, malgré la recréation du cœur : campagne arrêtée (voir 14_coeur_*.txt, 12_ue*.log)"
+                  echo "campagne=arretee_ue_non_connectes" >> "$LOGS/09_etapes.txt"
+                  break 3
+                fi
+                continue
+              fi
+              ECHECS_UE=0
               : > "$MAP"; for k in $(seq 1 "$NUE"); do echo "${IPS[$k]} ue$k" >> "$MAP"; done
               restaurer_persist() { bash "$WORK/py/restaurer_abonnes.sh" >/dev/null 2>&1; }
 
@@ -3141,6 +3303,9 @@ jobs:
               done
               UESP=""; for k in $(seq 1 "$NB_ATT"); do UESP="${UESP:+$UESP,}ue$k:${IPS[$k]}"; done
               BEN=""; for k in $(seq $(( NB_ATT + 1 )) "$NUE"); do BEN="${BEN:+$BEN,}ue$k:${IPS[$k]}"; done
+              # UE bénin de référence (le premier) : trafic et RTT de scenario.py, comme dans __9_ (port 5200+k) ;
+              # les autres UE bénins : trafics variés de trafic_benin.py. Un seul générateur par UE et par port.
+              BEN_REF="${BEN%%,*}"; BEN_AUTRES=""; [ "$BEN" != "$BEN_REF" ] && BEN_AUTRES="${BEN#*,}"
               echo "$RUN : attaquants=$UESP bénins=$BEN" | tee -a "$LOGS/63_ues_par_politique.txt"
 
               # xApp de décision
@@ -3171,14 +3336,16 @@ jobs:
               DSPID=$!
               sleep 3
 
-              # trafic bénin varié sur les UE bénins (+ flash crowd pour le scénario flash)
-              if [ -n "$BEN" ]; then
-                FLASH=""; [ "$SC" = flash ] && FLASH="--flash ue$(( NB_ATT + 1 )):12:15:12M"
-                sudo setsid nohup python3 trafic_benin.py --ues "$BEN" --total 55 $FLASH --events "$LOGS/69_benin_$RUN.jsonl" > "$LOGS/69_benin_${RUN}.log" 2>&1 < /dev/null &
+              # trafic bénin varié : sur les UE bénins autres que la référence ; pour flash (sans scenario.py), sur
+              # tous les UE bénins, et le premier passe brusquement à haut débit (flash crowd)
+              TB_UES="$BEN_AUTRES"; FLASH=""
+              [ "$SC" = flash ] && { TB_UES="$BEN"; FLASH="--flash ue$(( NB_ATT + 1 )):12:15:12M"; }
+              if [ -n "$TB_UES" ]; then
+                sudo setsid nohup python3 trafic_benin.py --ues "$TB_UES" --total 55 $FLASH --events "$LOGS/69_benin_$RUN.jsonl" > "$LOGS/69_benin_${RUN}.log" 2>&1 < /dev/null &
               fi
-              # attaque (ou rien pour flash) ; scenario.py écrit aussi la QoS de l'UE bénin ue(NB_ATT+1)
+              # attaque (ou rien pour flash) ; scenario.py fait aussi le trafic et la sonde RTT de l'UE bénin de référence
               if [ -n "$ATKS" ]; then
-                sudo python3 scenario.py --ues "$UESP${BEN:+,$BEN}" --attacks "$ATKS" --total 55 --events "$LOGS/62_ev_$RUN.jsonl" 2>&1 | tee "$LOGS/62_scenario_$RUN.log"
+                sudo python3 scenario.py --ues "$UESP${BEN_REF:+,$BEN_REF}" --attacks "$ATKS" --total 55 --events "$LOGS/62_ev_$RUN.jsonl" 2>&1 | tee "$LOGS/62_scenario_$RUN.log"
               else
                 printf '[]\n' > "$LOGS/62_ev_$RUN.jsonl"; sleep "$DUREE_ATTAQUE"   # flash : pas d'attaque
               fi
@@ -3215,11 +3382,13 @@ jobs:
       - name: 11. Bilan
         if: always()
         run: |
-          cd "$WORK/oai/doc/tutorial_resources/oai-cn5g" 2>/dev/null && for c in oai-amf oai-smf; do docker logs "$c" > "$LOGS/40_$c.log" 2>&1 || true; done
+          ( set +e +o pipefail; . "$WORK/py/coeur.sh"; etat_coeur fin ) || true
+          cd "$WORK/oai/doc/tutorial_resources/oai-cn5g" 2>/dev/null && for c in oai-amf oai-smf oai-nrf; do docker logs "$c" > "$LOGS/40_$c.log" 2>&1 || true; done
           # L'UPF journalise chaque paquet montant (« Upstream IP is ... ») : on garde un résumé
           # en paquets par seconde et par UE (preuve de la coupure), et le journal sans ces lignes.
-          docker logs oai-upf 2>&1 | grep -F "Upstream IP is" | awk '{t=substr($2,1,8); c[$1" "t" "$NF]++} END{for(k in c) print k, c[k]}' | tr -d '[]' | sort > "$LOGS/40_upf_pps.txt" || true
+          { cat "$LOGS"/41_oai-upf_avant_*.log 2>/dev/null || true; docker logs oai-upf 2>&1; } | grep -F "Upstream IP is" | awk '{t=substr($2,1,8); c[$1" "t" "$NF]++} END{for(k in c) print k, c[k]}' | tr -d '[]' | sort > "$LOGS/40_upf_pps.txt" || true
           docker logs oai-upf 2>&1 | grep -vF " IP is " > "$LOGS/40_oai-upf.log" || true
+          for f in "$LOGS"/41_oai-upf_avant_*.log; do [ -f "$f" ] || continue; grep -vF " IP is " "$f" > "$f.tmp" || true; mv "$f.tmp" "$f"; done
           sudo chmod -R a+r "$LOGS" || true
           LOGS="$LOGS" python3 "$WORK/py/bilan4.py" || ECHEC_BILAN=1
           # M4 : plan usager contre plan RAN, sur les essais où les KPM ont été enregistrés
