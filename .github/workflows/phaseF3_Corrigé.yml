@@ -1379,9 +1379,12 @@ jobs:
           Le modèle est enregistré avec son seuil : {"modele", "seuil", "algorithme"}.
 
           Phase 3 : si le CSV contient la colonne n_marques (paquets de vérité terrain comptés par
-          ids_xml5g.py), un intervalle est « attaque » quand au moins la moitié de ses paquets en
-          viennent ; l'ancienne règle (fenêtre + traîne sur frac_small) n'est plus qu'une
-          comparaison, rapportée dans les métriques (remarque M6 : étiquetage non circulaire).
+          ids_xml5g.py), un intervalle est « attaque » dès qu'il contient du trafic d'attaque (au moins
+          un paquet de vérité terrain) : la décision prise ensuite porte sur l'UE (« cet UE attaque-t-il ? »),
+          et un UE compromis continue d'émettre son trafic légitime pendant son attaque. La règle « moitié
+          des paquets » (essais du 24-25/10) laissait la règle 7 sur 10 sans réponse quand les intervalles
+          d'attaque majoritaire étaient rares. L'ancienne règle (fenêtre + traîne sur frac_small) n'est plus
+          qu'une comparaison, rapportée dans les métriques (remarque M6 : étiquetage non circulaire).
           """
           import argparse, json
           import numpy as np, pandas as pd, joblib
@@ -1434,7 +1437,7 @@ jobs:
                   y |= (dans | tail).astype(int)
               d["label_fenetre"] = y
               if "n_marques" in d.columns:
-                  d["label"] = (d["n_marques"].values >= 0.5 * d["n_pkts"].values).astype(int)
+                  d["label"] = (d["n_marques"].values >= 1).astype(int)
               else:
                   d["label"] = y
               return d
@@ -1445,7 +1448,7 @@ jobs:
               if "n_marques" not in d.columns:
                   return {"methode": "fenêtre + traîne (pas de vérité terrain)"}
               a, b = d["label"].values, d["label_fenetre"].values
-              return {"methode": "vérité terrain (n_marques >= 50 % des paquets)",
+              return {"methode": "vérité terrain (au moins un paquet d'attaque dans l'intervalle)",
                       "attaque_verite": int(a.sum()), "attaque_fenetre": int(b.sum()),
                       "fenetre_mais_pas_verite": int(((b == 1) & (a == 0)).sum()),
                       "verite_mais_pas_fenetre": int(((a == 1) & (b == 0)).sum())}
@@ -1819,7 +1822,7 @@ jobs:
                   gt = len(f) >= 8                               # 8e champ n_marques = vérité terrain présente
                   nm = int(f[7]) if gt else 0; npk = int(f[6]) if len(f) >= 7 else 0
                   if gt:                                         # étiquetage par vérité terrain (M6, non circulaire)
-                      if nm >= 0.5 * npk and npk > 0:
+                      if nm >= 1:                                # l'intervalle contient du trafic d'attaque
                           a_n += 1; a_p += v
                           if v and t >= 0 and t_al is None: t_al = t
                       else:
@@ -2228,7 +2231,7 @@ jobs:
               les 15 variables du plan usager sont recalculées sur EXACTEMENT la même fenêtre, à
               partir du journal de paquets 68_pkt (même fonction que le détecteur déployé) ;
             - mêmes étiquettes : vérité terrain par ports d'attaque (UDP 5555, TCP 80), une fenêtre
-              est « attaque » si la moitié au moins de ses paquets sont des paquets d'attaque ;
+              est « attaque » si elle contient du trafic d'attaque (règle du détecteur déployé) ;
             - même découpage : validation croisée par essai (un essai entier sort à chaque pli),
               même modèle (XGBoost, hyperparamètres de l'étude E1) et même règle de seuil que le
               détecteur déployé (F1 max sous 0,5 % de fausses alarmes, sur une validation tirée de
@@ -2518,7 +2521,7 @@ jobs:
                       ligne = dict(dossier=diag["dossier"], essai=run, scenario=sc, politique=pol, ran_ue_id=ran,
                                    teids=" ".join(map(str, tl)), ip=ip, role=role, t_debut=round(a, 6), t_fin=round(b, 6),
                                    debut_attaque=deb.get(ip, ""), n_marques=nm,
-                                   label=int(n > 0 and nm >= 0.5 * n),
+                                   label=int(nm >= 1),
                                    up_deploye=int(len(vv) > 0 and sum(vv) * 2 >= len(vv)), n_verdicts_deploye=len(vv),
                                    exclu=exclu)
                       for k, x in zip(UP_FEATURES, fu):
