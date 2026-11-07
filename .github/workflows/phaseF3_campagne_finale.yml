@@ -122,7 +122,9 @@ jobs:
                       **(T if test else dict(essais=n_x)))
           if "E4" in exps:
               for sc in ("udp", "flash"):
-                  add(f"E4-{sc}-1", exp="E4", scenarios=sc, politiques="ratio30 slice" if test else POL_E4,
+                  # attaque de 80 s pour TOUTES les politiques de E4 : ratio30 (Tsourdinis) a besoin d'environ 30 verdicts
+                  # (~25 s sous charge) avant de réduire ; même fenêtre pour toutes, pour une comparaison équitable
+                  add(f"E4-{sc}-1", exp="E4", scenarios=sc, politiques="ratio30 slice" if test else POL_E4, attaque=80,
                       **(T if test else dict(essais=n_x)))
           if "E8" in exps:
               add("E8-1", exp="E8", scenarios="pulse60" if test else "pulse50 pulse60 pulse70 pulse80", politiques="none",
@@ -1753,7 +1755,17 @@ jobs:
                       cmd = (f"fin=$((SECONDS+{int(du)})); while [ $SECONDS -lt $fin ]; do "
                              f"timeout {on} hping3 -i {a.flood_interval} {opt} {a.dn}; sleep {off}; done")
                   else:
-                      cmd = f"timeout {du} hping3 -i {a.flood_interval} {opt} {a.dn}"
+                      # inondation continue, RELANCÉE jusqu'à l'échéance : hping3 peut planter (assertion glibc),
+                      # ce qui écourtait l'attaque sous une politique qui NE libère PAS (ratio30, limite) et faussait
+                      # cette case. On le relance pour le temps restant ; mais si l'UE est coupé par la défense
+                      # (RRC Release -> tunnel retiré), hping3 ressort aussitôt (« Network is unreachable ») :
+                      # trois sorties de moins de 2 s de suite arrêtent la boucle (l'attaque est bien terminée).
+                      cmd = (f"fin=$((SECONDS+{int(du)})); coupe=0; "
+                             f"while [ $SECONDS -lt $fin ]; do reste=$((fin-SECONDS)); [ $reste -le 0 ] && break; "
+                             f"deb=$SECONDS; timeout $reste hping3 -i {a.flood_interval} {opt} {a.dn}; rc=$?; "
+                             f"[ $rc -eq 124 ] && break; "
+                             f"if [ $((SECONDS-deb)) -lt 2 ]; then coupe=$((coupe+1)); else coupe=0; fi; "
+                             f"[ $coupe -ge 3 ] && break; sleep 0.3; done")
                   p = sh(ns, cmd, bg=True, err=f"{base}_attaque{i}_{ns}.err")
                   p.wait()
                   end = time.time()
@@ -5791,7 +5803,7 @@ jobs:
         run: |
           test -f "$WORK/model.joblib" || { echo "::error::détecteur non entraîné (voir 50_train.log, 09_etapes.txt) : campagne arrêtée"; exit 1; }
           cp "$WORK/model.joblib" "$LOGS/model.joblib"
-          sha256sum "$LOGS/model.joblib" | tee "$LOGS/model.sha256"
+          ( cd "$LOGS" && sha256sum model.joblib ) | tee "$LOGS/model.sha256"
           python3 -c "import xgboost; print('xgboost', xgboost.__version__)" 2>/dev/null | tee -a "$LOGS/01_python.txt"
           cp "$WORK/xml5g-sources.tgz" "$LOGS/"
           sudo chmod -R a+r "$LOGS"
@@ -5840,9 +5852,9 @@ jobs:
           github-token: ${{ github.token }}
       - name: 0b. Version de XGBoost du détecteur
         run: |
-          v=$(awk '$1=="xgboost"{print $2}' /home/runner/detecteur/01_python.txt | tail -1)
+          v=$(awk '$1=="xgboost"{print $2}' /home/runner/detecteur/01_python.txt 2>/dev/null | tail -1 || true)
           echo "XGB_VERSION=$v" >> "$GITHUB_ENV"; echo "xgboost du détecteur : ${v:-inconnue}"
-          p=$(grep -m1 '^profil_radio=' /home/runner/detecteur/09_etapes.txt | cut -d= -f2)
+          p=$(grep -m1 '^profil_radio=' /home/runner/detecteur/09_etapes.txt 2>/dev/null | cut -d= -f2 || true)
           echo "PROFIL_FORCE=$p" >> "$GITHUB_ENV"; echo "profil radio du détecteur : ${p:-inconnu}"
       - name: 1. Libérer de l'espace disque
         run: |
@@ -5880,13 +5892,18 @@ jobs:
           mkdir -p "$WORK/bundle" && tar xzf /home/runner/detecteur/xml5g-sources.tgz -C "$WORK/bundle"
           cd "$WORK/oai"
           git apply --check "$WORK/bundle/xml5g.patch" && git apply "$WORK/bundle/xml5g.patch"
-          grep -c XML5G openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c | tee "$LOGS/03_correctif.txt"
+          n=$(grep -c XML5G openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c || true)
+          echo "${n:-0}" | tee "$LOGS/03_correctif.txt"
+          [ "${n:-0}" -gt 0 ] || { echo "::error::correctif xML5G non appliqué à OAI"; exit 1; }
           FX="$WORK/oai/openair2/E2AP/flexric/examples/xApp/c"
           cp -r "$WORK/bundle/rc_release" "$WORK/bundle/xapp_xml5g" "$FX/"
           printf "add_subdirectory(rc_release)\nadd_subdirectory(xapp_xml5g)\n" >> "$FX/CMakeLists.txt"
           cp -r "$WORK/bundle/py" "$WORK/" && chmod +x "$WORK/py/"*.sh
           cp /home/runner/detecteur/model.joblib "$WORK/model.joblib"
-          ( cd /home/runner/detecteur && sha256sum -c model.sha256 ) | tee "$LOGS/03_modele_verifie.txt"
+          attendu=$(awk '{print $1; exit}' /home/runner/detecteur/model.sha256)
+          obtenu=$(sha256sum "$WORK/model.joblib" | awk '{print $1}')
+          echo "modèle figé : empreinte attendue $attendu, obtenue $obtenu" | tee "$LOGS/03_modele_verifie.txt"
+          [ -n "$attendu" ] && [ "$attendu" = "$obtenu" ] || { echo "::error::modèle figé absent ou différent de celui du job detecteur"; exit 1; }
           cp /home/runner/detecteur/50_train_metrics.json "$LOGS/50_train_metrics.json"
           echo '${{ toJSON(matrix) }}' > "$LOGS/63_tranche.json"
       - name: 5. Compiler OAI — environ 8 min
@@ -5930,7 +5947,7 @@ jobs:
           sudo chmod -R a+r "$LOGS" || true
           # M4 : plan usager contre plan RAN, sur les essais où les KPM ont été enregistrés
           python3 "$WORK/py/analyse_partie_b.py" --out "$LOGS/bilan_tranche" "$LOGS" --detecteur "$LOGS/50_train_metrics.json" > "$LOGS/bilan_tranche.log" 2>&1 || echo "::warning::bilan de la tranche : voir bilan_tranche.log"
-          [ -s "$LOGS/bilan_tranche/B_rapport.md" ] && sed -n "1,40p" "$LOGS/bilan_tranche/B_rapport.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ -s "$LOGS/bilan_tranche/B_rapport.md" ]; then sed -n "1,40p" "$LOGS/bilan_tranche/B_rapport.md" >> "$GITHUB_STEP_SUMMARY"; fi
           sudo chmod -R a+r "$LOGS" || true
       - name: 10. Journaux de la tranche (artefact au nom unique)
         if: always()
@@ -5975,18 +5992,18 @@ jobs:
         run: |
           D=campagne/xml5g-p3f-detecteur
           mkdir -p outils resultats && tar xzf "$D/xml5g-sources.tgz" -C outils
-          v=$(awk '$1=="xgboost"{print $2}' "$D/01_python.txt" | tail -1)
+          v=$(awk '$1=="xgboost"{print $2}' "$D/01_python.txt" 2>/dev/null | tail -1 || true)
           sudo pip3 install --break-system-packages --no-deps -q "xgboost${v:+==$v}" || true
           KPM_DIRS=$(find campagne -name '67_kpm_*.log' -printf '%h\n' | sort -u)
           if [ -n "$KPM_DIRS" ]; then
             python3 outils/py/m4_deux_plans.py --out resultats/m4 $KPM_DIRS > resultats/m4.log 2>&1 || echo "::warning::m4 : voir m4.log"
           fi
-          python3 outils/py/analyse_partie_b.py --out resultats --m4 resultats/m4 --detecteur "$D/50_train_metrics.json" campagne > resultats/analyse.log 2>&1
-          code=$?
+          code=0
+          python3 outils/py/analyse_partie_b.py --out resultats --m4 resultats/m4 --detecteur "$D/50_train_metrics.json" campagne > resultats/analyse.log 2>&1 || code=$?
           cp campagne/xml5g-p3f-plan/63_plan.json resultats/ 2>/dev/null || true
           { echo "## Résultats de la campagne (partie B)"; echo; cat resultats/B_rapport.md; } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-          [ -s resultats/m4/70_m4_deux_plans.md ] && cat resultats/m4/70_m4_deux_plans.md >> "$GITHUB_STEP_SUMMARY"
-          tail -20 resultats/analyse.log
+          if [ -s resultats/m4/70_m4_deux_plans.md ]; then cat resultats/m4/70_m4_deux_plans.md >> "$GITHUB_STEP_SUMMARY"; fi
+          tail -20 resultats/analyse.log || true
           exit $code
       - name: 5. Archive complète (journaux de toutes les tranches et résultats)
         if: always()
