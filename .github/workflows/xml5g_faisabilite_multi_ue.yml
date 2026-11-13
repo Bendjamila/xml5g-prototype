@@ -1,0 +1,1921 @@
+# xML5G — TEST DE FAISABILITÉ À PLUSIEURS UE (novembre 2026), environ une heure.
+#
+# Question : la plateforme tient-elle 3 ou 4 UE, dont DEUX attaquants en même temps, sur la machine gratuite de
+# GitHub (4 cœurs) ? La campagne finale (exécution 42399410787) n'a que 2 UE : c'est la première critique attendue.
+#
+# Ce test reprend le job « essais » de la campagne finale sans rien changer au détecteur ni à la xApp :
+#   - le détecteur FIGÉ de la campagne (exécution 42379234623) est téléchargé, son empreinte est vérifiée ;
+#   - OAI, FlexRIC, le cœur 5G, le correctif E2SM-RC et la xApp sont ceux de la campagne (mêmes versions).
+# Changements, tous dans trois scripts (étape 4b ; différences exactes dans 03_scripts_modifies.txt) :
+#   - campagne.sh : nombre d'UE réglable (NUE), scénario « multi » (ue1 inonde en UDP et ue2 en SYN, en même temps),
+#     politique « xml5g714 » (7 sur 14, la règle donnée par l'algorithme de dimensionnement de l'article) ;
+#   - scenario.py : les attaques dont les fenêtres se recouvrent sont simultanées (avant : l'une après l'autre) ;
+#   - plateforme.sh : le profil radio léger (25 PRB) reçoit l'option --CO -400000000 de la documentation d'OAI
+#     (sans elle, l'accès aléatoire échouait dans la campagne finale).
+# Chaque configuration tourne dans son propre job, en parallèle. Nom d'une configuration :
+#   <PRB>-<nombre d'UE>[-isole]     ex. 106-3-isole = profil 106 PRB, 3 UE, détecteur seul sur un cœur.
+# Le job « synthese » réunit tout dans UNE archive légère : xml5g-f4-RESULTATS.
+
+name: xML5G faisabilité plusieurs UE
+
+on:
+  workflow_dispatch:
+    inputs:
+      configurations:
+        description: "Configurations à essayer (PRB-UE, avec -isole pour un cœur réservé au détecteur)"
+        default: "106-3 106-3-isole 106-4-isole 25-2 25-3 25-4"
+      essais:
+        description: "Essais valides visés par (scénario, politique)"
+        default: "2"
+      budget_min:
+        description: "Minutes d'essais par configuration (le job entier dure environ 25 min de plus)"
+        default: "32"
+      detecteur_run_id:
+        description: "Exécution qui a produit le détecteur figé (ne pas changer)"
+        default: "42379234623"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  OAI_COMMIT: 1c2f4d3c2e68181cdef9f426d161163147ad4b77
+  FLEXRIC_COMMIT: d7a71285f3720fbc1487e9a86309eec5fb61a408
+  WORK: /home/runner/xml5g
+  LOGS: /home/runner/xml5g-journaux
+  DUREE_E1: "600"
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrice: ${{ steps.p.outputs.matrice }}
+      detecteur_run: ${{ steps.p.outputs.detecteur_run }}
+    steps:
+      - name: Plan du test (fixé avant le premier essai)
+        id: p
+        env:
+          CONFIGURATIONS: ${{ inputs.configurations }}
+          ESSAIS: ${{ inputs.essais }}
+          BUDGET_MIN: ${{ inputs.budget_min }}
+          DETECTEUR_RUN_ID: ${{ inputs.detecteur_run_id }}
+        run: |
+          python3 - <<'PLAN_EOF'
+          import json, os, re, zlib
+          E = os.environ
+          confs = (E.get("CONFIGURATIONS") or "106-3 106-3-isole 106-4-isole 25-2 25-3 25-4").split()
+          n = int(E.get("ESSAIS") or 2); budget = int(E.get("BUDGET_MIN") or 32)
+          M = []
+          for c in confs:
+              m = re.fullmatch(r"(106|25)-([2-4])(-isole)?", c)
+              if not m:
+                  raise SystemExit(f"configuration inconnue : {c} (attendu : 106-3, 106-3-isole, 25-4, ...)")
+              nue = int(m.group(2))
+              d = dict(id="F-" + c, exp="F4", profil="106PRB" if m.group(1) == "106" else "leger", nue=nue,
+                       charge="isole" if m.group(3) else "standard", runner="ubuntu-24.04", essais=n, budget=budget,
+                       offset=100 * (len(M) + 1), attaque=40, duree_e1=600, kpm="", pcap="",
+                       graine=zlib.crc32(c.encode()) % 100000 + 1)
+              if nue == 2:      # témoin : un attaquant et un UE bénin, comme la campagne finale
+                  d.update(scenarios="udp syn flash", politiques="none xml5g", exclues="")
+              else:             # deux attaquants en même temps, les autres UE bénins ; puis foule bénigne, sans attaquant
+                  d.update(scenarios="multi flash", politiques="none xml5g xml5g714", exclues="flash_none")
+              M.append(d)
+          with open(E["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrice=" + json.dumps({"include": M}) + "\n")
+              f.write("detecteur_run=" + (E.get("DETECTEUR_RUN_ID") or "42379234623") + "\n")
+          s = ["### Plan du test de faisabilité", "",
+               "| Configuration | Profil radio | UE | Détecteur | Scénarios | Politiques | Cases non lancées | Essais par case | Minutes d'essais |",
+               "|---|---|---|---|---|---|---|---|---|"]
+          s += [f"| {d['id']} | {d['profil']} | {d['nue']} | {'cœur réservé' if d['charge'] == 'isole' else 'cœurs partagés'} | {d['scenarios']} | "
+                f"{d['politiques']} | {d['exclues'] or '—'} | {d['essais']} | {d['budget']} |" for d in M]
+          s += ["", "multi : ue1 inonde en UDP et ue2 en SYN, en même temps, pendant 40 s ; les autres UE sont bénins.",
+                "flash : aucun attaquant ; un UE bénin passe brusquement à 12 Mbit/s pendant 15 s.",
+                "xml5g : libération à 7 verdicts d'attaque sur 10 (règle de la campagne). xml5g714 : 7 sur 14."]
+          open(E["GITHUB_STEP_SUMMARY"], "a").write("\n".join(s) + "\n")
+          print(json.dumps(M, indent=1, ensure_ascii=False))
+          PLAN_EOF
+
+  essais:
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrice) }}
+    env:
+      EXPERIENCE: ${{ matrix.exp }}
+      SCENARIOS: ${{ matrix.scenarios }}
+      DUREE_ATTAQUE: ${{ matrix.attaque }}
+      POLITIQUES: ${{ matrix.politiques }}
+      CASES_EXCLUES: ${{ matrix.exclues }}
+      ESSAIS: ${{ matrix.essais }}
+      OFFSET: ${{ matrix.offset }}
+      CHARGE: ${{ matrix.charge }}
+      KPM_POLITIQUES: ${{ matrix.kpm }}
+      PCAP_POLITIQUES: ${{ matrix.pcap }}
+      BUDGET_MIN: ${{ matrix.budget }}
+      TRANCHE: ${{ matrix.id }}
+      GRAINE: ${{ matrix.graine }}
+      DUREE_E1: ${{ matrix.duree_e1 }}
+      NUE: ${{ matrix.nue }}
+      PROFIL_FORCE: ${{ matrix.profil }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 0. Télécharger le détecteur figé et les sources
+        uses: actions/download-artifact@v4
+        with:
+          name: xml5g-p3f-detecteur
+          path: /home/runner/detecteur
+          run-id: ${{ needs.plan.outputs.detecteur_run }}
+          github-token: ${{ github.token }}
+      - name: 0b. Version de XGBoost et profil radio du détecteur figé
+        run: |
+          v=$(awk '$1=="xgboost"{print $2}' /home/runner/detecteur/01_python.txt 2>/dev/null | tail -1 || true)
+          echo "XGB_VERSION=$v" >> "$GITHUB_ENV"; echo "xgboost du détecteur : ${v:-inconnue}"
+          p=$(grep -m1 '^profil_radio=' /home/runner/detecteur/09_etapes.txt 2>/dev/null | cut -d= -f2 || true)
+          echo "PROFIL_DETECTEUR=${p:-106PRB}" >> "$GITHUB_ENV"
+          echo "profil radio du détecteur : ${p:-inconnu} ; profil demandé pour cette configuration : $PROFIL_FORCE"
+      - name: 1. Libérer de l'espace disque
+        run: |
+
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          docker image prune -a -f > /dev/null 2>&1 || true
+          mkdir -p "$WORK" "$LOGS"
+          df -h / | tee "$LOGS/00_disque.txt"
+      - name: 2. Préparer la machine
+        run: |
+
+          sudo modprobe sctp || { sudo apt-get update -q && sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe sctp; }
+          sudo apt-get install -y -q hping3 iperf3 python3-sklearn python3-pandas python3-joblib python3-scipy tcpdump sysstat > "$LOGS/01_apt.log" 2>&1 || \
+            { sudo apt-get update -q && sudo apt-get install -y -q hping3 iperf3 python3-sklearn python3-pandas python3-joblib python3-scipy tcpdump sysstat >> "$LOGS/01_apt.log" 2>&1; }
+          sudo sysctl -w net.ipv4.ip_forward=1
+          python3 -c "import sklearn, pandas, joblib; print('sklearn', sklearn.__version__)" | tee "$LOGS/01_python.txt"
+          # XGBoost : le modèle retenu par l'étude sur les jeux publics (E1). Sans ses dépendances
+          # facultatives (GPU), pour ne pas toucher au numpy/scipy du système.
+          sudo pip3 install --break-system-packages --no-deps -q "xgboost${XGB_VERSION:+==$XGB_VERSION}" >> "$LOGS/01_apt.log" 2>&1 || echo "::warning::xgboost non installé : repli Random Forest"
+          { sudo python3 -c "import xgboost; print('xgboost', xgboost.__version__)" 2>&1 || echo "xgboost absent : repli Random Forest"; } | tee -a "$LOGS/01_python.txt"
+          { nproc; free -h; } > "$LOGS/01_machine.txt"
+      - name: 3. Récupérer OAI et FlexRIC (versions figées)
+        run: |
+
+          cd "$WORK"
+          git init -q oai && cd oai
+          git remote add origin https://github.com/duranta-project/openairinterface5g.git
+          git fetch -q --depth 1 origin "$OAI_COMMIT" && git checkout -q FETCH_HEAD
+          cd openair2/E2AP && rm -rf flexric && git init -q flexric && cd flexric
+          git remote add origin https://github.com/duranta-project/flexric.git
+          git fetch -q --depth 1 origin "$FLEXRIC_COMMIT" && git checkout -q FETCH_HEAD
+          { echo "OAI     $(git -C "$WORK/oai" rev-parse HEAD)"; echo "FlexRIC $(git rev-parse HEAD)"; } | tee "$LOGS/02_versions.txt"
+      - name: 4. Appliquer le correctif, les xApps et les scripts du détecteur figé
+        run: |
+          mkdir -p "$WORK/bundle" && tar xzf /home/runner/detecteur/xml5g-sources.tgz -C "$WORK/bundle"
+          cd "$WORK/oai"
+          git apply --check "$WORK/bundle/xml5g.patch" && git apply "$WORK/bundle/xml5g.patch"
+          n=$(grep -c XML5G openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c || true)
+          echo "${n:-0}" | tee "$LOGS/03_correctif.txt"
+          [ "${n:-0}" -gt 0 ] || { echo "::error::correctif xML5G non appliqué à OAI"; exit 1; }
+          FX="$WORK/oai/openair2/E2AP/flexric/examples/xApp/c"
+          cp -r "$WORK/bundle/rc_release" "$WORK/bundle/xapp_xml5g" "$FX/"
+          printf "add_subdirectory(rc_release)\nadd_subdirectory(xapp_xml5g)\n" >> "$FX/CMakeLists.txt"
+          cp -r "$WORK/bundle/py" "$WORK/" && chmod +x "$WORK/py/"*.sh
+          cp /home/runner/detecteur/model.joblib "$WORK/model.joblib"
+          attendu=$(awk '{print $1; exit}' /home/runner/detecteur/model.sha256)
+          obtenu=$(sha256sum "$WORK/model.joblib" | awk '{print $1}')
+          echo "modèle figé : empreinte attendue $attendu, obtenue $obtenu" | tee "$LOGS/03_modele_verifie.txt"
+          [ -n "$attendu" ] && [ "$attendu" = "$obtenu" ] || { echo "::error::modèle figé absent ou différent de celui du job detecteur"; exit 1; }
+          cp /home/runner/detecteur/50_train_metrics.json "$LOGS/50_train_metrics.json"
+          echo '${{ toJSON(matrix) }}' > "$LOGS/63_tranche.json"
+      - name: 4b. Scripts des essais à plusieurs UE (scenario.py, campagne.sh, plateforme.sh) et bilan
+        run: |
+          # Les scripts du paquet figé sont gardés (py_fige) : 03_scripts_modifies.txt donne les différences exactes.
+          cp -r "$WORK/py" "$WORK/py_fige"
+          cat > "$WORK/py/scenario.py" <<'SCEN_F4_EOF'
+          #!/usr/bin/env python3
+          """
+          xML5G - déroulé d'un scénario de phase 2 et génération des événements.
+          Trafic bénin de fond (iperf3, un serveur par UE, repli ping) et sonde de RTT horodatée
+          sur tous les UEs pendant toute la durée,
+          puis une ou plusieurs attaques (SYN ou UDP flood via hping3), chacune lancée depuis
+          l'espace de noms d'un UE sur une fenêtre de temps. Écrit les événements
+          (ip, ns, type, start, end) en JSONL, avec la même horloge que le détecteur et l'xApp.
+            --attacks "ue1:syn:20:30,ue2:udp:70:30"   (espace de noms : type : début s : durée s)
+          Essais à plusieurs attaquants (novembre 2026) : chaque attaque tourne dans son propre fil, à partir de
+          son instant de début. Deux attaques dont les fenêtres se recouvrent sont donc SIMULTANÉES
+          (« ue1:udp:10:40,ue2:syn:10:40 »). Avant, la seconde attendait la fin de la première. Une seule attaque,
+          ou des attaques qui se suivent, se déroulent comme avant.
+          """
+          import argparse, json, os, subprocess, threading, time
+
+          def sh(ns, cmd, bg=False, err=None):
+              # les erreurs sont conservées dans un fichier : sans elles, une attaque qui
+              # s'arrête au bout de 2 s ne laisse aucune trace
+              full = ["sudo", "ip", "netns", "exec", ns, "bash", "-lc", cmd]
+              e = open(err, "w") if err else subprocess.DEVNULL
+              if bg:
+                  return subprocess.Popen(full, stdout=subprocess.DEVNULL, stderr=e)
+              return subprocess.run(full, stdout=subprocess.DEVNULL, stderr=e)
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--dn", default="192.168.70.135")     # serveur du réseau de données
+              ap.add_argument("--ues", required=True, help="ex. ue1:10.0.0.2,ue2:10.0.0.3")
+              ap.add_argument("--attacks", required=True, help="ex. ue1:syn:20:30,ue2:udp:70:30")
+              ap.add_argument("--total", type=float, default=60)
+              # 0,5 Mbit/s : sous la capacité montante du lien radio simulé (0,7 à 3,4 Mbit/s mesurés),
+              # pour que l'UE bénin ne sature pas son propre lien et que son RTT de base reste faible
+              ap.add_argument("--benign-rate", default="2M")
+              ap.add_argument("--flood-interval", default="u100", help="intervalle hping3 entre paquets (u100 = 100 µs)")
+              ap.add_argument("--events", required=True)
+              a = ap.parse_args()
+              ues = dict(u.split(":") for u in a.ues.split(",") if ":" in u)
+              atks = []
+              for x in a.attacks.split(","):
+                  ns, typ, st, du = x.split(":")
+                  atks.append((ns, typ, float(st), float(du)))
+              atks.sort(key=lambda z: z[2])
+              base = os.path.splitext(a.events)[0]
+              t0 = time.time()
+              bg = []
+              for ns in ues:
+                  # Trafic bénin : iperf3 UDP 5 Mbit/s vers un serveur DÉDIÉ à chaque UE (port 5200 + k),
+                  # pour que deux UEs ne se disputent pas un seul serveur (« server is busy »).
+                  # Repli sur un ping régulier si le serveur ne répond pas.
+                  port = 5200 + int(ns[2:]) if ns[2:].isdigit() else 5201
+                  bg.append(sh(ns, f"iperf3 -c {a.dn} -p {port} -t {int(a.total)} -b {a.benign_rate} -u || "
+                                   f"ping -q -i 0.02 -s 1200 -w {int(a.total)} {a.dn}",
+                               bg=True, err=f"{base}_benin_{ns}.err"))
+                  # Sonde de RTT (qualité de service) : un ping horodaté toutes les 200 ms, par UE.
+                  bg.append(sh(ns, f"stdbuf -oL ping -D -i 0.2 -w {int(a.total)} {a.dn} > {base}_rtt_{ns}.txt 2>&1",
+                               bg=True))
+              ev = []
+              verrou = threading.Lock()
+
+              def attaque(i, ns, typ, st, du):
+                  time.sleep(max(0, st - (time.time() - t0)))
+                  opt = "-S -p 80" if typ == "syn" else "--udp -p 5555 -d 1400"
+                  start = time.time()
+                  # débit limité (~10 000 paquets/s) plutôt que --flood : --flood occupe un cœur entier, ce qui
+                  # saturait la machine d'émulation ; 10 000 paquets/s restent un flood pour un seul UE
+                  if typ.startswith("pulse"):
+                      # campagne finale (E8) : inondation UDP intermittente, active pendant NN % de chaque période de 2 s
+                      on = round(int(typ[5:]) / 100 * 2.0, 2); off = round(2.0 - on, 2)
+                      cmd = (f"fin=$((SECONDS+{int(du)})); while [ $SECONDS -lt $fin ]; do "
+                             f"timeout {on} hping3 -i {a.flood_interval} {opt} {a.dn}; sleep {off}; done")
+                  else:
+                      # inondation continue, RELANCÉE jusqu'à l'échéance : hping3 peut planter (assertion glibc),
+                      # ce qui écourtait l'attaque sous une politique qui NE libère PAS (ratio30, limite) et faussait
+                      # cette case. On le relance pour le temps restant ; mais si l'UE est coupé par la défense
+                      # (RRC Release -> tunnel retiré), hping3 ressort aussitôt (« Network is unreachable ») :
+                      # trois sorties de moins de 2 s de suite arrêtent la boucle (l'attaque est bien terminée).
+                      cmd = (f"fin=$((SECONDS+{int(du)})); coupe=0; "
+                             f"while [ $SECONDS -lt $fin ]; do reste=$((fin-SECONDS)); [ $reste -le 0 ] && break; "
+                             f"deb=$SECONDS; timeout $reste hping3 -i {a.flood_interval} {opt} {a.dn}; rc=$?; "
+                             f"[ $rc -eq 124 ] && break; "
+                             f"if [ $((SECONDS-deb)) -lt 2 ]; then coupe=$((coupe+1)); else coupe=0; fi; "
+                             f"[ $coupe -ge 3 ] && break; sleep 0.3; done")
+                  p = sh(ns, cmd, bg=True, err=f"{base}_attaque{i}_{ns}.err")
+                  p.wait()
+                  end = time.time()
+                  if end - start < 0.5 * du:
+                      print(f"ATTENTION : l'attaque {i} ({ns}, {typ}) a duré {end - start:.1f} s au lieu de {du:.0f} s "
+                            f"(voir {base}_attaque{i}_{ns}.err)")
+                  with verrou:
+                      ev.append(dict(ip=ues[ns], ns=ns, type=typ, start=round(start, 3), end=round(end, 3)))
+
+              fils = []
+              for i, (ns, typ, st, du) in enumerate(atks, 1):
+                  if ns not in ues:
+                      print(f"ATTENTION : {ns} n'a pas d'adresse (--ues), attaque {i} ignorée")
+                      continue
+                  th = threading.Thread(target=attaque, args=(i, ns, typ, st, du))
+                  th.start(); fils.append(th)
+              for th in fils:
+                  th.join()
+              ev.sort(key=lambda e: e["start"])
+              time.sleep(max(0, a.total - (time.time() - t0)))
+              for q in bg:
+                  try: q.terminate()
+                  except Exception: pass
+              open(a.events, "w").write("".join(json.dumps(e) + "\n" for e in ev))
+              print(json.dumps(ev, indent=2))
+
+          if __name__ == "__main__":
+              main()
+          SCEN_F4_EOF
+          cat > "$WORK/py/campagne.sh" <<'CAMP_F4_EOF'
+          #!/bin/bash
+          # xML5G — campagne finale de phase 3 : boucle d'essais d'UNE tranche (un job de la matrice).
+          # Reprend la boucle de l'étape 10 de phaseF3_Corrigé.yml (commit 15f1874, exécution flash du 25/10/2026) avec :
+          #   - un détecteur FIGÉ, entraîné une seule fois par le job « detecteur » et téléchargé ici ;
+          #   - plusieurs scénarios par tranche (SCENARIOS), l'ordre des politiques tiré au hasard à chaque tour ;
+          #   - des politiques supplémentaires (voir options_politique), dont les deux formes de la règle de Tsourdinis et al.
+          #     et son schéma d'action complet (ratio30) ;
+          #   - les scénarios « benin » (E1, trafic bénin seul, essais longs) et « pulseNN » (E8, inondation intermittente) ;
+          #   - la charge « isole » (E3) : le détecteur seul sur le dernier cœur, tout le reste sur les autres ;
+          #   - une capture SCTP des échanges E2 pour les politiques PCAP_POLITIQUES, et 63_essais.csv qui décrit chaque essai.
+          # Variables attendues (job) : WORK LOGS GNB_CONF UE_RF SM_DIR FR_CONF ; tranche : EXPERIENCE SCENARIOS POLITIQUES ESSAIS
+          # OFFSET CHARGE DUREE_E1 DUREE_ATTAQUE KPM_POLITIQUES PCAP_POLITIQUES BUDGET_MIN TRANCHE GRAINE.
+          #
+          # Essais à plusieurs UE (novembre 2026), sans rien changer au détecteur, à la xApp ni au déroulé d'un essai :
+          #   - NUE (2 par défaut) : nombre d'UE de la cellule ; au-delà de 2, les UE sont lancés à ECART_UE secondes
+          #     d'intervalle (6 par défaut) au lieu d'ensemble ;
+          #   - scénarios « multi » (ue1 inonde en UDP et ue2 en SYN, EN MÊME TEMPS ; les autres UE sont bénins) et
+          #     « multiudp » (ue1 et ue2 inondent tous deux en UDP) ;
+          #   - politique « xml5g714 » : libération quand 7 des 14 derniers verdicts de l'UE sont des attaques
+          #     (règle donnée par l'algorithme de dimensionnement de l'article) ;
+          #   - CASES_EXCLUES : cases « scénario_politique » à ne pas lancer (ex. « flash_none ») ;
+          #   - 66_cpu_<essai>.txt : compteurs de /proc/stat avant et après le trafic (occupation de la machine).
+          set +e +o pipefail
+          . "$WORK/py/coeur.sh"
+          if [ ! -f "$WORK/model.joblib" ]; then
+            echo "::error::détecteur figé absent ($WORK/model.joblib) : tranche annulée"
+            echo "campagne=annulee_sans_detecteur" >> "$LOGS/09_etapes.txt"
+            exit 0
+          fi
+          cd "$WORK/py" || exit 1
+          B="$WORK/oai/cmake_targets/ran_build/build"
+          FR="$WORK/oai/openair2/E2AP/flexric/build"
+          CONF="$GNB_CONF"
+
+          EXPERIENCE="${EXPERIENCE:-E2}"; SCENARIOS="${SCENARIOS:-${SCENARIO:-udp}}"; POLITIQUES="${POLITIQUES:-xml5g none}"
+          NVALIDE="${ESSAIS:-5}"; OFFSET="${OFFSET:-0}"; CHARGE="${CHARGE:-standard}"; DUREE_E1="${DUREE_E1:-600}"
+          KPM_POLITIQUES="${KPM_POLITIQUES:-}"; PCAP_POLITIQUES="${PCAP_POLITIQUES:-}"; GRAINE="${GRAINE:-1}"
+          DUREE_ATTAQUE="${DUREE_ATTAQUE:-40}"; LIMITE_THROTTLE="${LIMITE_THROTTLE:-512kbit}"
+          TOTAL=$(( DUREE_ATTAQUE + 15 ))       # durée du trafic d'un essai (55 s pour une attaque de 40 s, comme 15f1874)
+          MAX_TOURS=$(( NVALIDE + 3 ))
+          NUE="${NUE:-2}"                        # nombre d'UE de la cellule (2 dans la campagne finale)
+          ECART_UE="${ECART_UE:-6}"              # au-delà de 2 UE : secondes entre deux lancements d'UE
+          CASES_EXCLUES="${CASES_EXCLUES:-}"     # cases « scénario_politique » à ne pas lancer
+          case "$NUE" in [2-9]) ;; *) echo "::error::NUE=$NUE : valeur attendue de 2 à 9"; exit 0 ;; esac
+          echo "nue=$NUE" >> "$LOGS/09_etapes.txt"
+          echo "tranche ${TRANCHE:-?} : expérience=$EXPERIENCE scénarios=[$SCENARIOS] politiques=[$POLITIQUES] essais=$NVALIDE charge=$CHARGE attaque=${DUREE_ATTAQUE}s KPM=[$KPM_POLITIQUES] PCAP=[$PCAP_POLITIQUES]" | tee -a "$LOGS/09_etapes.txt"
+
+          MAP="/tmp/xml5g_ues_map.txt"; export XML5G_UES_MAP="$MAP"
+          export XML5G_LIMITE="$LIMITE_THROTTLE"
+
+          # ---------- charge (E3) : détecteur isolé sur le dernier cœur ----------
+          TS_DET=""; TS_RAN=""; CPU_DET=""; CPU_RAN=""
+          if [ "$CHARGE" = isole ]; then
+            NC=$(nproc)
+            if [ "$NC" -ge 3 ]; then
+              CPU_DET=$(( NC - 1 )); CPU_RAN="0-$(( NC - 2 ))"
+              TS_DET="taskset -c $CPU_DET"; TS_RAN="taskset -c $CPU_RAN"
+              echo "charge=isole : détecteur sur le cœur $CPU_DET, RAN, cœur 5G et trafic sur $CPU_RAN" | tee -a "$LOGS/09_etapes.txt"
+            else
+              echo "::warning::charge isole demandée mais seulement $NC cœurs : essais en charge standard"
+              CHARGE=standard
+            fi
+          fi
+          isoler_conteneurs() {
+            [ -n "$CPU_RAN" ] || return 0
+            for c in $(docker ps -q); do docker update --cpuset-cpus "$CPU_RAN" "$c" > /dev/null 2>&1; done
+          }
+
+          arreter_ran() {
+            sudo pkill -f nr-uesoftmodem; sudo pkill -f nr-softmodem
+            sudo pkill -f nearRT-RIC; sudo pkill -f xapp_kpm_moni
+            sudo pkill -f "ids_xml5g.py --mode detect"
+            sudo pkill -f "allocateur_ratio.py" 2>/dev/null
+            sudo pkill -f "tcpdump -i lo" 2>/dev/null
+            sleep 5
+          }
+          duree_ids() { if [ "$SC" = benin ]; then echo $(( DUREE_E1 + 25 )); else echo $(( TOTAL + 25 )); fi; }
+          duree_xapp() { echo $(( $(duree_ids) + 10 )); }
+          lancer_detecteur() {   # avant le gNB : le modèle se charge sur une machine encore peu chargée
+            local plog="--pktlog $LOGS/68_pkt_$RUN.csv.gz"
+            [ "$SC" = benin ] && [ "${PKTLOG_E1:-non}" != oui ] && plog=""
+            # shellcheck disable=SC2086
+            sudo -E setsid nohup $TS_DET nice -n -10 stdbuf -oL python3 ids_xml5g.py --mode detect --iface oai-cn5g --upf 192.168.70.134 \
+              --bin 0.2 --duration "$(duree_ids)" --min-pkts 1 --model "$WORK/model.joblib" --xapp 127.0.0.1:9999 --attente-xapp 900 \
+              --out "$LOGS/61_ids_$RUN.log" --summary "$LOGS/61_ids_${RUN}_summary.json" $plog \
+              > "$LOGS/61_ids_${RUN}_run.log" 2>&1 < /dev/null &
+            IDSPID=$!
+          }
+          demarrer_ran() {   # $1 = étiquette de journal ; $2 = nombre d'UE à lancer
+            local tag=$1 nue=$2 k i
+            # shellcheck disable=SC2086
+            sudo setsid nohup $TS_RAN stdbuf -oL -eL "$FR/examples/ric/nearRT-RIC" -c "$FR_CONF" -p "$SM_DIR/" > "$LOGS/10_ric_$tag.log" 2>&1 < /dev/null &
+            sleep 3
+            # shellcheck disable=SC2086
+            sudo setsid nohup $TS_RAN stdbuf -oL -eL "$B/nr-softmodem" -O "$CONF" '--gNBs.[0].min_rxtxtime' 6 --rfsim --e2_agent.sm_dir "$SM_DIR/" > "$LOGS/11_gnb_$tag.log" 2>&1 < /dev/null &
+            for i in $(seq 1 90); do
+              grep -q "Received NGSetupResponse from AMF" "$LOGS/11_gnb_$tag.log" && grep -q "E2 SETUP RESPONSE rx" "$LOGS/11_gnb_$tag.log" && break
+              sleep 2
+            done
+            for k in $(seq 1 "$nue"); do
+              [ -e "/var/run/netns/ue$k" ] || sudo bash "$WORK/oai/tools/scripts/multi-ue.sh" -c"$k"
+              printf 'uicc0 = {\nimsi = "00101000000000%s";\nkey = "fec86ba6eb707ed08905757b1bb44b8f";\nopc= "C42449363BBAD02B66D16BC975D77CC1";\npdu_sessions = ({ dnn = "oai"; nssai_sst = 1; });\n}\n' "$k" > "$WORK/ue$k.conf"
+              OFF[$k]=$(stat -c %s "$LOGS/12_ue$k.log" 2>/dev/null || echo 0)
+              # shellcheck disable=SC2086
+              sudo setsid nohup $TS_RAN stdbuf -oL -eL ip netns exec "ue$k" "$B/nr-uesoftmodem" -O "$WORK/ue$k.conf" $UE_RF --rfsim '--rfsimulator.[0].serveraddr' "10.20$k.1.100" >> "$LOGS/12_ue$k.log" 2>&1 < /dev/null &
+              [ "$nue" -gt 2 ] && [ "$k" -lt "$nue" ] && sleep "$ECART_UE"
+            done
+          }
+          declare -A OFF
+          refus_coeur() {
+            tail -c +$(( ${OFF[$1]:-0} + 1 )) "$LOGS/12_ue$1.log" 2>/dev/null | grep -qE "Illegal_UE|Authentication Reject"
+          }
+          ue_pret() {   # $1 = k ; renvoie l'adresse de l'UE (vide si échec), garantit route + ping
+            local k=$1 ip_ tun essai i
+            for essai in 1 2; do
+              for i in $(seq 1 40); do
+                ip_=$(sudo ip netns exec "ue$k" ip -o -4 addr show 2>/dev/null | awk '/oaitun/{split($4,a,"/"); print a[1]; exit}')
+                [ -n "$ip_" ] && break
+                if refus_coeur "$k"; then echo "ue$k refusé par le cœur" >&2; echo ""; return; fi
+                pgrep -f "ue$k.conf" > /dev/null || break
+                sleep 3
+              done
+              if [ -n "$ip_" ]; then
+                tun=$(sudo ip netns exec "ue$k" ip -o -4 addr show | awk '/oaitun/{print $2; exit}')
+                sudo ip netns exec "ue$k" ip route replace 192.168.70.0/24 dev "$tun"
+                if sudo ip netns exec "ue$k" ping -c 2 -W 2 192.168.70.135 > /dev/null 2>&1; then echo "$ip_"; return; fi
+              fi
+              [ "$essai" = 2 ] && break
+              sudo pkill -f "ue$k.conf"; sleep 10
+              OFF[$k]=$(stat -c %s "$LOGS/12_ue$k.log" 2>/dev/null || echo 0)
+              # shellcheck disable=SC2086
+              sudo setsid nohup $TS_RAN stdbuf -oL -eL ip netns exec "ue$k" "$B/nr-uesoftmodem" -O "$WORK/ue$k.conf" $UE_RF --rfsim '--rfsimulator.[0].serveraddr' "10.20$k.1.100" >> "$LOGS/12_ue$k.log" 2>&1 < /dev/null &
+              sleep 5
+            done
+            echo ""
+          }
+          # Politiques : variables de la xApp. W = 10 et θ = 0,7 par défaut (règle déployée) ; les politiques les remplacent.
+          #   none          aucune action ; la xApp journalise l'instant où 7 sur 10 aurait libéré (WOULD_RELEASE)
+          #   xml5g         libération par E2SM-RC quand 7 des 10 derniers verdicts de l'UE sont des attaques (règle déployée)
+          #   xml5g8        idem avec 8 sur 10 (recommandation a posteriori, évaluée hors échantillon par E1)
+          #   unan1s        unanimité sur fenêtre TEMPORELLE de 1 s : notre adaptation de la condition de Tsourdinis et al.
+          #   unan30        unanimité sur les 30 derniers verdicts : la condition d'origine de Tsourdinis et al. (comptage)
+          #   ratio30       schéma d'action complet de Tsourdinis et al. : plafond de débit proportionnel au taux d'anomalie des
+          #                 30 derniers verdicts (allocateur_ratio.py), libération à 100 % (xApp, 30 sur 30)
+          #   throttle      graduée : plafond de 512 kbit/s à la 1re règle 7 sur 10, libération si elle se redéclenche 5 s après
+          #   limite        plafond de 512 kbit/s à la 1re règle 7 sur 10, sans jamais libérer (E4 : apport de la libération)
+          #   immediate     libération au premier verdict « attaque »
+          #   slice         au premier verdict « attaque » d'un UE, libération de tous les UE de la cellule
+          #   xml5g_persist xml5g, puis retrait de l'abonnement de l'UE libéré dans la base du cœur (E9 : réattachement)
+          options_politique() {
+            case "$1" in
+              xml5g)         POL_ENV="XML5G_POLICY=xml5g" ;;
+              xml5g8)        POL_ENV="XML5G_POLICY=xml5g XML5G_THETA=0.8" ;;
+              xml5g714)      POL_ENV="XML5G_POLICY=xml5g XML5G_W=14 XML5G_THETA=0.5" ;;
+              unan1s)        POL_ENV="XML5G_POLICY=tsourdinis XML5G_REPORT_S=1" ;;
+              unan30|ratio30) POL_ENV="XML5G_POLICY=xml5g XML5G_W=30 XML5G_THETA=1.0" ;;
+              throttle)      POL_ENV="XML5G_POLICY=throttle XML5G_GRACE_S=5 XML5G_THROTTLE_CMD=\"bash $WORK/py/limiter_ue.sh %s\"" ;;
+              limite)        POL_ENV="XML5G_POLICY=throttle XML5G_GRACE_S=1000000 XML5G_THROTTLE_CMD=\"bash $WORK/py/limiter_ue.sh %s\"" ;;
+              xml5g_persist) POL_ENV="XML5G_POLICY=xml5g_persist XML5G_ON_RELEASE_CMD=\"bash $WORK/py/bloquer_abonne.sh %s\"" ;;
+              immediate|slice|none) POL_ENV="XML5G_POLICY=$1" ;;
+              *) echo "::error::politique inconnue : $1"; POL_ENV="XML5G_POLICY=none" ;;
+            esac
+          }
+          parametres_politique() {   # W et θ effectivement appliqués (pour 63_essais.csv)
+            case "$1" in xml5g8) echo "10,0.8" ;; xml5g714) echo "14,0.5" ;; unan30|ratio30) echo "30,1.0" ;; *) echo "10,0.7" ;; esac
+          }
+          attaques_du_scenario() {
+            case "$1" in
+              udp)     ATKS="ue1:udp:10:$DUREE_ATTAQUE"; NB_ATT=1 ;;
+              syn)     ATKS="ue1:syn:10:$DUREE_ATTAQUE"; NB_ATT=1 ;;
+              pulse*)  ATKS="ue1:$1:10:$DUREE_ATTAQUE"; NB_ATT=1 ;;
+              multi)   ATKS="ue1:udp:10:$DUREE_ATTAQUE,ue2:syn:10:$DUREE_ATTAQUE"; NB_ATT=2 ;;
+              multiudp) ATKS="ue1:udp:10:$DUREE_ATTAQUE,ue2:udp:10:$DUREE_ATTAQUE"; NB_ATT=2 ;;
+              flash|benin) ATKS=""; NB_ATT=0 ;;
+              *) echo "::error::scénario inconnu : $1"; ATKS=""; NB_ATT=0 ;;
+            esac
+          }
+          # E1 : paires d'applications bénignes, fixées d'avance ; l'essai n° j prend la paire (j mod 8)
+          PAIRES=("tcp:voip" "dash:web" "video:idleburst" "burst:iot" "web:tcp" "idleburst:dash" "voip:video" "iot:burst")
+          ordre_politiques() {   # $1 = clé (tour et scénario) ; ordre aléatoire reproductible
+            printf '%s\n' $POLITIQUES | shuf --random-source=<(openssl enc -aes-256-ctr -pass "pass:${GRAINE}-$1" -nosalt -pbkdf2 < /dev/zero 2> /dev/null)
+          }
+
+          . "$WORK/goulot.sh"
+          DEBUT=$(date +%s); BUDGET_S=$(( ${BUDGET_MIN:-270} * 60 ))
+          : > "$LOGS/63_validite.txt"; : > "$LOGS/63_ues_par_politique.txt"; : > "$LOGS/63_ordre.txt"
+          echo "essai,experience,scenario,politique,W,theta,charge,cpu_detecteur,types_benins,duree_s,duree_attaque_s,tranche,tour,ordre_dans_tour,debut_utc" > "$LOGS/63_essais.csv"
+          ECHECS_UE=0
+          declare -A NV NE
+          for SC in $SCENARIOS; do for POL in $POLITIQUES; do NV[${SC}_${POL}]=0; NE[${SC}_${POL}]=0; done; done
+          bash "$WORK/py/provisionner_abonnes.sh" "$NUE" >> "$LOGS/13_abonnes.txt" 2>&1
+          J=0
+
+          for TOUR in $(seq 1 "$MAX_TOURS"); do
+          for SC in $SCENARIOS; do
+            attaques_du_scenario "$SC"
+            ORDRE=$(ordre_politiques "$TOUR-$SC" | tr '\n' ' ')
+            [ -n "$ORDRE" ] || ORDRE="$POLITIQUES"
+            echo "tour $TOUR, $SC : $ORDRE" >> "$LOGS/63_ordre.txt"
+            POS=0
+            for POL in $ORDRE; do
+              POS=$(( POS + 1 )); CLE="${SC}_${POL}"
+              case " $CASES_EXCLUES " in *" $CLE "*) continue ;; esac
+              if [ "$NB_ATT" -ge "$NUE" ]; then echo "::error::scénario $SC : $NB_ATT attaquants pour $NUE UE, il faut au moins un UE bénin"; continue; fi
+              [ "${NV[$CLE]}" -ge "$NVALIDE" ] && continue
+              if [ $(( $(date +%s) - DEBUT )) -gt "$BUDGET_S" ]; then echo "::warning::budget de temps atteint"; break 3; fi
+              NE[$CLE]=$(( ${NE[$CLE]} + 1 )); RUN="${POL}_${SC}_r$(( OFFSET + NE[$CLE] ))"
+              echo "=== $RUN (valides ${NV[$CLE]}/$NVALIDE) ==="
+              options_politique "$POL"
+              declare -a IPS; IPS=(); ok=1
+              for tentative in 1 2; do
+                arreter_ran
+                if [ "$tentative" = 1 ]; then reparer_coeur "${RUN}_t1"; else reparer_coeur "${RUN}_t2" complet; fi
+                case " $REPARES " in *" mysql "*) bash "$WORK/py/provisionner_abonnes.sh" "$NUE" >> "$LOGS/13_abonnes.txt" 2>&1 ;; esac
+                isoler_conteneurs
+                lancer_detecteur; sleep 20
+                demarrer_ran "$RUN" "$NUE"; poser_goulot
+                ok=1; IPS=()
+                for k in $(seq 1 "$NUE"); do
+                  ip_=$(ue_pret "$k"); IPS[$k]="$ip_"
+                  [ -z "$ip_" ] && { ok=0; echo "$RUN : tentative $tentative, ue$k sans adresse"; break; }
+                done
+                [ "$ok" = 1 ] && break
+              done
+              if [ "$ok" != 1 ]; then
+                echo "$RUN invalide UE_non_connecte" >> "$LOGS/63_validite.txt"; etat_coeur "${RUN}_echec"
+                ECHECS_UE=$(( ECHECS_UE + 1 ))
+                if [ "$ECHECS_UE" -ge 3 ]; then
+                  echo "::error::3 essais de suite sans UE connecté, malgré la recréation du cœur : tranche arrêtée (voir 14_coeur_*.txt, 12_ue*.log)"
+                  echo "campagne=arretee_ue_non_connectes" >> "$LOGS/09_etapes.txt"
+                  break 3
+                fi
+                continue
+              fi
+              ECHECS_UE=0
+              : > "$MAP"; for k in $(seq 1 "$NUE"); do echo "${IPS[$k]} ue$k" >> "$MAP"; done
+
+              docker exec oai-ext-dn pkill iperf3 > /dev/null 2>&1; sleep 1
+              for k in $(seq 1 "$NUE"); do
+                docker exec -d oai-ext-dn iperf3 -s -p $((5200 + k)) -J --logfile /tmp/iperf_$((5200 + k)).json > /dev/null 2>&1
+                docker exec -d oai-ext-dn iperf3 -s -p $((5300 + k)) > /dev/null 2>&1
+              done
+              UESP=""; for k in $(seq 1 "$NB_ATT"); do UESP="${UESP:+$UESP,}ue$k:${IPS[$k]}"; done
+              BEN=""; for k in $(seq $(( NB_ATT + 1 )) "$NUE"); do BEN="${BEN:+$BEN,}ue$k:${IPS[$k]}"; done
+              BEN_REF="${BEN%%,*}"; BEN_AUTRES=""; [ "$BEN" != "$BEN_REF" ] && BEN_AUTRES="${BEN#*,}"
+              echo "$RUN : attaquants=$UESP bénins=$BEN" | tee -a "$LOGS/63_ues_par_politique.txt"
+              TYPES=""
+              if [ "$SC" = benin ]; then
+                P="${PAIRES[$(( (OFFSET / 100 + J) % ${#PAIRES[@]} ))]}"; J=$(( J + 1 ))
+                TYPES="ue1:${P%%:*},ue2:${P##*:}"
+              fi
+              WT=$(parametres_politique "$POL")
+              echo "$RUN,$EXPERIENCE,$SC,$POL,${WT%%,*},${WT##*,},$CHARGE,${CPU_DET:-},${TYPES//,/;},$( [ "$SC" = benin ] && echo "$DUREE_E1" || echo "$TOTAL" ),$( [ -n "$ATKS" ] && echo "$DUREE_ATTAQUE" || echo 0 ),${TRANCHE:-},$TOUR,$POS,$(date -u +%FT%TZ)" >> "$LOGS/63_essais.csv"
+
+              # capture SCTP des échanges E2 (gNB <-> RIC, port 36421) et E42 (RIC <-> xApps, 36422) : en-têtes seulement
+              case " $PCAP_POLITIQUES " in
+                *" $POL "*|*" tout "*)
+                  # shellcheck disable=SC2086
+                  sudo setsid nohup $TS_RAN tcpdump -i lo -nn -s 96 -U -w "$LOGS/71_e2_$RUN.pcap" sctp > /dev/null 2>&1 < /dev/null & ;;
+              esac
+              # xApp de décision (θ et W par défaut, remplacés par ceux de la politique)
+              eval "XML5G_W=10 XML5G_THETA=0.7 $POL_ENV XML5G_DURATION=$(duree_xapp) XML5G_PORT=9999 \
+                sudo -E setsid nohup $TS_RAN nice -n -10 stdbuf -oL \"$FR/examples/xApp/c/xapp_xml5g/xapp_xml5g\" -c \"$FR_CONF\" -p \"$SM_DIR/\" > \"$LOGS/60_xapp_$RUN.log\" 2>&1 < /dev/null &"
+              XPID=$!
+              case " $KPM_POLITIQUES " in
+                *" $POL "*|*" tout "*)
+                  sudo -E setsid nohup $TS_RAN bash -c "XAPP_DURATION=$(( $(duree_xapp) + 10 )) stdbuf -oL '$FR/examples/xApp/c/monitor/xapp_kpm_moni' -c '$FR_CONF' -p '$SM_DIR/' 2>&1 | python3 -u '$WORK/py/horodater.py'" > "$LOGS/67_kpm_$RUN.log" 2>&1 < /dev/null & ;;
+              esac
+              for i in $(seq 1 30); do grep -q "détecteur connecté" "$LOGS/60_xapp_$RUN.log" 2>/dev/null && break; sleep 2; done
+              if ! grep -q "détecteur connecté" "$LOGS/60_xapp_$RUN.log" 2>/dev/null; then
+                echo "$RUN invalide detecteur_non_connecte" >> "$LOGS/63_validite.txt"
+                sudo kill $XPID 2>/dev/null; sudo pkill -TERM -f "xapp_kpm_moni -c" 2>/dev/null
+                sudo pkill -f "ids_xml5g.py --mode detect"; sudo pkill -f "tcpdump -i lo" 2>/dev/null; sleep 2; sudo rm -f /tmp/xapp_db_* 2>/dev/null
+                continue
+              fi
+              # ratio30 : plafond de débit proportionnel au taux d'anomalie des 30 derniers verdicts (schéma de Tsourdinis et al.)
+              if [ "$POL" = ratio30 ]; then
+                # shellcheck disable=SC2086
+                sudo setsid nohup $TS_RAN python3 allocateur_ratio.py --ids "$LOGS/61_ids_$RUN.log" --map "$MAP" --fenetre 30 \
+                  --duree "$(duree_ids)" --log "$LOGS/72_ratio_$RUN.log" > "$LOGS/72_ratio_${RUN}_run.log" 2>&1 < /dev/null &
+              fi
+              sleep 7
+              PIDS=$(pgrep -d, -f "ids_xml5g.py --mode detect|xapp_xml5g -c|xapp_kpm_moni -c|nr-softmodem|nr-uesoftmodem")
+              [ -n "$PIDS" ] && { pidstat -h -u -r -p "$PIDS" 1 > "$LOGS/65_pidstat_$RUN.txt" 2>&1 & echo $! > /tmp/pidstat.pid; }
+              ( while true; do echo "$(date +%s) $(docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' oai-upf 2>/dev/null)"; sleep 2; done ) > "$LOGS/66_docker_$RUN.txt" 2>&1 &
+              DSPID=$!
+              sleep 3
+              { echo "avant $(date +%s.%N) $(head -1 /proc/stat)"; } > "$LOGS/66_cpu_$RUN.txt"
+
+              if [ "$SC" = benin ]; then
+                # E1 : les deux UE bénins, applications de la paire fixée d'avance, pendant DUREE_E1 secondes
+                # shellcheck disable=SC2086
+                sudo $TS_RAN python3 trafic_benin.py --ues "$BEN" --types "$TYPES" --total "$DUREE_E1" --events "$LOGS/69_benin_$RUN.jsonl" > "$LOGS/69_benin_${RUN}.log" 2>&1
+                printf '[]\n' > "$LOGS/62_ev_$RUN.jsonl"
+              else
+                TB_UES="$BEN_AUTRES"; FLASH=""
+                [ "$SC" = flash ] && { TB_UES="$BEN"; FLASH="--flash ue$(( NB_ATT + 1 )):12:15:12M"; }
+                if [ -n "$TB_UES" ]; then
+                  # shellcheck disable=SC2086
+                  sudo setsid nohup $TS_RAN python3 trafic_benin.py --ues "$TB_UES" --total "$TOTAL" $FLASH --events "$LOGS/69_benin_$RUN.jsonl" > "$LOGS/69_benin_${RUN}.log" 2>&1 < /dev/null &
+                fi
+                if [ -n "$ATKS" ]; then
+                  # shellcheck disable=SC2086
+                  sudo $TS_RAN python3 scenario.py --ues "$UESP${BEN_REF:+,$BEN_REF}" --attacks "$ATKS" --total "$TOTAL" --events "$LOGS/62_ev_$RUN.jsonl" 2>&1 | tee "$LOGS/62_scenario_$RUN.log"
+                else
+                  printf '[]\n' > "$LOGS/62_ev_$RUN.jsonl"; sleep "$DUREE_ATTAQUE"
+                fi
+              fi
+              { echo "apres $(date +%s.%N) $(head -1 /proc/stat)"; } >> "$LOGS/66_cpu_$RUN.txt"
+              wait $IDSPID 2>/dev/null
+              sleep 12
+              sudo kill $XPID 2>/dev/null
+              sudo pkill -TERM -f "xapp_kpm_moni -c" 2>/dev/null
+              sudo pkill -f "allocateur_ratio.py" 2>/dev/null
+              [ -f /tmp/pidstat.pid ] && { kill "$(cat /tmp/pidstat.pid)" 2>/dev/null; rm -f /tmp/pidstat.pid; }
+              kill $DSPID 2>/dev/null
+              sudo pkill -INT -f "tcpdump -i lo" 2>/dev/null; sleep 2
+              [ -f "$LOGS/71_e2_$RUN.pcap" ] && sudo gzip -f "$LOGS/71_e2_$RUN.pcap"
+              sudo rm -f /tmp/xapp_db_* 2>/dev/null
+              for k in $(seq 1 "$NUE"); do docker exec oai-ext-dn cat /tmp/iperf_$((5200 + k)).json > "$LOGS/64_iperf_${RUN}_p$((5200 + k)).json" 2>/dev/null; done
+              bash "$WORK/py/restaurer_abonnes.sh" > /dev/null 2>&1     # remet les abonnés retirés par xml5g_persist
+
+              # validité (critères fixés d'avance, 63_plan.json) : le détecteur a joint la xApp ; le trafic bénin a tourné
+              # (flash, benin) ou l'attaque a été lancée ; pour benin, au moins 80 % de la durée couverte par des verdicts
+              valide=1; raison=""
+              if grep -q "injoignable" "$LOGS/61_ids_${RUN}_run.log" 2>/dev/null; then valide=0; raison="xapp_injoignable"
+              elif ! grep -q "détecteur connecté" "$LOGS/60_xapp_$RUN.log" 2>/dev/null; then valide=0; raison="detecteur_non_connecte"
+              elif [ "$SC" = flash ] || [ "$SC" = benin ]; then
+                [ -s "$LOGS/69_benin_$RUN.jsonl" ] || { valide=0; raison="trafic_benin_absent"; }
+                if [ "$valide" = 1 ] && [ "$SC" = benin ]; then
+                  cov=$(awk '$1=="V"{t=$2/1e6; if(!a||t<a)a=t; if(t>b)b=t} END{print (b>a)?int(b-a):0}' "$LOGS/61_ids_$RUN.log" 2>/dev/null)
+                  [ "${cov:-0}" -ge $(( DUREE_E1 * 8 / 10 )) ] || { valide=0; raison="verdicts_incomplets_${cov:-0}s"; }
+                fi
+              else grep -q '"start"' "$LOGS/62_ev_$RUN.jsonl" 2>/dev/null || { valide=0; raison="attaque_non_lancee"; }
+              fi
+              if [ "$valide" = 1 ]; then
+                echo "$RUN valide" >> "$LOGS/63_validite.txt"; NV[$CLE]=$(( ${NV[$CLE]} + 1 ))
+              else
+                echo "$RUN invalide $raison" >> "$LOGS/63_validite.txt"
+              fi
+              sleep 1
+            done
+          done
+          done
+          for SC in $SCENARIOS; do for POL in $POLITIQUES; do
+            case " $CASES_EXCLUES " in *" ${SC}_${POL} "*) continue ;; esac
+            echo "$SC/$POL : ${NV[${SC}_${POL}]} valides sur ${NE[${SC}_${POL}]}" | tee -a "$LOGS/09_etapes.txt"
+          done; done
+          arreter_ran
+          CAMP_F4_EOF
+          cat > "$WORK/py/plateforme.sh" <<'PLAT_F4_EOF'
+          #!/bin/bash
+          # xML5G — mise en route de la plateforme : étape 7 de phaseF3_Corrigé.yml (15f1874), sortie dans un script
+          # pour être exécutée à l'identique par le job du détecteur et par chaque tranche d'essais.
+          # PROFIL_FORCE=106PRB : profil radio imposé (celui du détecteur) ; SANS_UES=oui : pas de connexion d'UE ici.
+          # Essais à plusieurs UE (novembre 2026) : PROFIL_FORCE=leger demande le profil léger (25 PRB, bande 66, FDD).
+          # Dans la campagne finale ce profil échouait à l'accès aléatoire (« RA failed at state WAIT_Msg3 ») : la ligne de
+          # commande de l'UE n'avait pas l'écart de fréquence montante de la bande 66 (--CO -400000000, donné par la
+          # documentation d'OAI). Il est ajouté ici. Si le profil léger échoue encore, on retombe sur 106 PRB et
+          # 09_etapes.txt le dit (profil_radio=106PRB, profil_demande_non_obtenu=leger).
+          set +e +o pipefail
+          # GitHub lance bash avec -e -o pipefail : une recherche d'adresse encore vide
+          # (grep sans résultat) arrêtait toute l'étape. On gère les erreurs nous-mêmes.
+
+          cd "$WORK/oai/doc/tutorial_resources/oai-cn5g"
+          S="mysql oai-nrf oai-udr oai-udm oai-ausf oai-amf oai-smf oai-upf oai-ext-dn"
+          for i in 1 2 3; do docker compose pull -q $S && break; echo "::warning::docker pull : nouvel essai ($i)"; sleep 30; done
+          docker compose up -d $S
+          for i in $(seq 1 60); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' oai-ext-dn 2>/dev/null)" = healthy ] && break; sleep 5; done
+          sleep 10; docker compose ps | tee "$LOGS/13_coeur.txt"
+          # deux serveurs iperf3 dans le réseau de données, un par UE (ports 5201 et 5202) :
+          # avec un seul serveur, le second UE recevait « server is busy » et retombait sur un ping
+          for P in 5201 5202; do docker exec -d oai-ext-dn iperf3 -s -p $P > /dev/null 2>&1; done
+          sleep 1
+          n_srv=$(docker exec oai-ext-dn pgrep -c iperf3 2>/dev/null)
+          if [ "${n_srv:-0}" -ge 2 ]; then echo "iperf3_dn=ok (2 serveurs)" >> "$LOGS/09_etapes.txt"
+          else echo "iperf3_dn=absent" >> "$LOGS/09_etapes.txt"; echo "::warning::serveurs iperf3 absents : trafic bénin par ping"; fi
+          # fuseau horaire du conteneur UPF (son journal est horodaté à l'heure locale du conteneur)
+          echo "upf_tz=$(docker exec oai-upf date +%z 2>/dev/null || echo +0000)" >> "$LOGS/09_etapes.txt"
+          FR="$WORK/oai/openair2/E2AP/flexric/build"
+          sudo setsid nohup stdbuf -oL -eL "$FR/examples/ric/nearRT-RIC" -c "$FR_CONF" -p "$SM_DIR/" > "$LOGS/10_ric.log" 2>&1 < /dev/null &
+          sleep 3
+          B="$WORK/oai/cmake_targets/ran_build/build"
+          CD="$WORK/oai/targets/PROJECTS/GENERIC-NR-5GC/CONF"
+          CONF106="$CD/gnb.sa.band78.fr1.106PRB.usrpb210.conf"
+          # PROFIL RADIO LÉGER : 25 PRB à 15 kHz (5 MHz) au lieu de 106 PRB à 30 kHz (40 MHz), soit
+          # environ 8 fois moins d'échantillons radio à calculer. Avec 106 PRB, l'émulation saturait les
+          # 4 cœurs avant toute attaque (gNB ~170 %, chaque UE ~100 %) et le RTT mesurait la charge de la
+          # machine. Configuration rfsim d'OAI adaptée à notre cœur (PLMN 001/01, adresses, agent E2).
+          LIGHT="$WORK/gnb_light.conf"
+          sed -e 's/mcc = 208; mnc = 99;/mcc = 001; mnc = 01;/' \
+              -e 's/192\.168\.71\.132/192.168.70.132/' \
+              -e 's#192\.168\.71\.140/26#192.168.70.129/24#g' "$CD/gnb.sa.band66.u0.25prb.rfsim.conf" > "$LIGHT"
+          printf '\ne2_agent = {\n  near_ric_ip_addr = "127.0.0.1";\n  sm_dir = "/usr/local/lib/flexric/"\n};\n' >> "$LIGHT"
+          grep -nE "mcc|amf_ip_address|GNB_IPV4|e2_agent|near_ric" "$LIGHT" > "$LOGS/07_gnb_light_conf.txt"
+          lancer_gnb() {   # $1 = configuration, $2 = suffixe du journal
+            sudo setsid nohup stdbuf -oL -eL "$B/nr-softmodem" -O "$1" '--gNBs.[0].min_rxtxtime' 6 --rfsim --e2_agent.sm_dir "$SM_DIR/" > "$LOGS/11_gnb$2.log" 2>&1 < /dev/null &
+            for i in $(seq 1 60); do grep -q "Received NGSetupResponse from AMF" "$LOGS/11_gnb$2.log" && grep -q "E2 SETUP RESPONSE rx" "$LOGS/11_gnb$2.log" && return 0; sleep 2; done
+            return 1
+          }
+          creer_ue() {     # espace de noms et fichier de l'UE $1 (une seule fois)
+            [ -e "/var/run/netns/ue$1" ] || sudo bash "$WORK/oai/tools/scripts/multi-ue.sh" -c$1
+            printf 'uicc0 = {\nimsi = "00101000000000%s";\nkey = "fec86ba6eb707ed08905757b1bb44b8f";\nopc= "C42449363BBAD02B66D16BC975D77CC1";\npdu_sessions = ({ dnn = "oai"; nssai_sst = 1; });\n}\n' "$1" > "$WORK/ue$1.conf"
+          }
+          # essai préalable du profil léger : gNB attaché à l'AMF et au RIC, puis UE1 attaché
+          PROFIL=106PRB; GNB_CONF="$CONF106"; UE_RF="-r 106 --numerology 1 --band 78 -C 3619200000"
+          if [ "${PROFIL_FORCE:-}" = 106PRB ]; then
+            echo "profil radio imposé : 106PRB (celui du détecteur figé)"
+          elif lancer_gnb "$LIGHT" "_essai_leger"; then
+            creer_ue 1
+            grep -m1 "Command line parameters for OAI UE" "$LOGS/11_gnb_essai_leger.log" | sed 's/^.*Command line/ue_leger_selon_gnb=Command line/' >> "$LOGS/09_etapes.txt"
+            sudo setsid nohup stdbuf -oL -eL ip netns exec ue1 "$B/nr-uesoftmodem" -O "$WORK/ue1.conf" -r 25 --numerology 0 --band 66 -C 2152680000 --CO -400000000 --ssb 48 --rfsim '--rfsimulator.[0].serveraddr' "10.201.1.100" > "$LOGS/12_ue1_essai_leger.log" 2>&1 < /dev/null &
+            for i in $(seq 1 40); do sudo ip netns exec ue1 ip -o -4 addr show 2>/dev/null | grep -q oaitun && { PROFIL=leger; break; }; sleep 3; done
+          fi
+          sudo pkill -f nr-uesoftmodem; sudo pkill -f nr-softmodem; sleep 5
+          if [ "$PROFIL" = leger ]; then
+            GNB_CONF="$LIGHT"; UE_RF="-r 25 --numerology 0 --band 66 -C 2152680000 --CO -400000000 --ssb 48"
+          else
+            echo "::warning::profil radio léger non opérationnel : retour à la configuration 106 PRB"
+          fi
+          echo "profil_radio=$PROFIL" >> "$LOGS/09_etapes.txt"
+          if [ -n "${PROFIL_FORCE:-}" ] && [ "$PROFIL_FORCE" != "$PROFIL" ]; then
+            echo "::warning::profil radio obtenu ($PROFIL) différent du profil demandé ($PROFIL_FORCE)"
+            echo "profil_demande_non_obtenu=$PROFIL_FORCE" >> "$LOGS/09_etapes.txt"
+          fi
+          [ "$PROFIL" = "${PROFIL_DETECTEUR:-106PRB}" ] || echo "profil_different_du_detecteur=${PROFIL_DETECTEUR:-106PRB}" >> "$LOGS/09_etapes.txt"
+          echo "GNB_CONF=$GNB_CONF" >> "$GITHUB_ENV"; echo "UE_RF=$UE_RF" >> "$GITHUB_ENV"
+          # santé du cœur 5G avant de connecter les UE (coeur.sh)
+          . "$WORK/py/coeur.sh"
+          reparer_coeur avant_gnb
+          case " $REPARES " in *" oai-ext-dn "*) for P in 5201 5202; do docker exec -d oai-ext-dn iperf3 -s -p $P > /dev/null 2>&1; done ;; esac
+          lancer_gnb "$GNB_CONF" "" || echo "::error::le gNB ne s'attache pas à l'AMF ou au RIC"
+          mkdir -p "$WORK"
+          cat > "$WORK/goulot.sh" <<'GOULOT_SH'
+          BW_GOULOT="${BW_GOULOT:-20mbit}"
+          docker exec oai-upf sh -c "command -v tc >/dev/null 2>&1" || docker exec oai-upf sh -c "(apt-get update && apt-get install -y iproute2) >/dev/null 2>&1 || (apk add --no-cache iproute2) >/dev/null 2>&1" || echo "::warning::tc indisponible dans oai-upf"
+          upf_if() { docker exec oai-upf sh -c 'ip -o link 2>/dev/null | sed -E "s/^[0-9]+: ([^:@]+).*/\1/" | grep -E "tun|gtp|ogstun" | head -1' | tr -d "\r"; }
+          upf_if_fallback() { docker exec oai-upf sh -c 'ip route show default 2>/dev/null | awk "{for(i=1;i<=NF;i++) if(\$i==\"dev\") print \$(i+1)}" | head -1' | tr -d "\r"; }
+          poser_goulot() {
+            IF=$(upf_if); [ -z "$IF" ] && IF=$(upf_if_fallback); [ -z "$IF" ] && IF=eth0
+            GOULOT_IF=""; GOULOT_DEV=""; : > /tmp/tcerr
+            docker exec oai-upf tc qdisc del dev "$IF" root 2>/dev/null
+            if docker exec oai-upf tc qdisc add dev "$IF" root tbf rate "$BW_GOULOT" burst 32kbit latency 50ms 2>>/tmp/tcerr; then
+              GOULOT_IF="$IF"; GOULOT_DEV="$IF"; echo "goulot=$BW_GOULOT (tbf sur $IF)" | tee -a "$LOGS/09_etapes.txt"; return; fi
+            docker exec oai-upf sh -c "modprobe ifb numifbs=1 2>/dev/null; ip link add ifb0 type ifb 2>/dev/null; ip link set ifb0 up 2>/dev/null" 2>/dev/null
+            docker exec oai-upf tc qdisc del dev "$IF" ingress 2>/dev/null; docker exec oai-upf tc qdisc del dev ifb0 root 2>/dev/null
+            if docker exec oai-upf tc qdisc add dev "$IF" handle ffff: ingress 2>>/tmp/tcerr && docker exec oai-upf tc filter add dev "$IF" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev ifb0 2>>/tmp/tcerr && docker exec oai-upf tc qdisc add dev ifb0 root handle 1: htb default 10 2>>/tmp/tcerr && docker exec oai-upf tc class add dev ifb0 parent 1: classid 1:10 htb rate "$BW_GOULOT" ceil "$BW_GOULOT" burst 15k quantum 1514 2>>/tmp/tcerr; then
+              docker exec oai-upf tc qdisc add dev ifb0 parent 1:10 handle 10: netem limit 100 2>/dev/null || docker exec oai-upf tc qdisc add dev ifb0 parent 1:10 handle 10: bfifo limit 150000 2>/dev/null || true
+              GOULOT_IF="$IF"; GOULOT_DEV="ifb0"; echo "goulot=$BW_GOULOT (ingress $IF -> ifb0)" | tee -a "$LOGS/09_etapes.txt"; return; fi
+            echo "::error::goulot NON pose sur '$IF' : $(head -1 /tmp/tcerr 2>/dev/null)"; echo "goulot=ECHEC sur $IF" >> "$LOGS/09_etapes.txt"
+          }
+          verifier_goulot() { [ -z "$GOULOT_DEV" ] && return 1; docker exec oai-upf tc -s qdisc show dev "$GOULOT_DEV" 2>/dev/null | grep -qE "tbf|htb"; }
+          GOULOT_SH
+          . "$WORK/goulot.sh"
+          poser_goulot
+          if verifier_goulot; then
+            echo "::notice::goulot actif sur $GOULOT_DEV ($BW_GOULOT)"; echo "goulot_verifie=oui" >> "$LOGS/09_etapes.txt"
+          else
+            echo "::warning::goulot INACTIF - verifier le nom d'interface UPF"; echo "goulot_verifie=non" >> "$LOGS/09_etapes.txt"
+            docker exec oai-upf sh -c "ip -o link; echo ---QDISC---; tc qdisc show; echo ---IFB0---; tc -s qdisc show dev ifb0 2>&1; echo ---ERR---; cat /tmp/tcerr 2>/dev/null" > "$LOGS/07_upf_interfaces.txt" 2>&1 || true
+          fi
+          connecter_ues() {   # boucle d'origine, mise en fonction pour pouvoir la rejouer
+          UES=""
+          for k in 1 2; do
+            creer_ue $k
+            cat > /dev/null <<UECONF_EOF
+          uicc0 = {
+          imsi = "00101000000000$k";
+          key = "fec86ba6eb707ed08905757b1bb44b8f";
+          opc= "C42449363BBAD02B66D16BC975D77CC1";
+          pdu_sessions = ({ dnn = "oai"; nssai_sst = 1; });
+          }
+          UECONF_EOF
+            ip_ue=""
+            for essai in 1 2 3; do
+              sudo setsid nohup stdbuf -oL -eL ip netns exec ue$k "$B/nr-uesoftmodem" -O "$WORK/ue$k.conf" $UE_RF --rfsim '--rfsimulator.[0].serveraddr' "10.20$k.1.100" >> "$LOGS/12_ue$k.log" 2>&1 < /dev/null &
+              sleep 5
+              for i in $(seq 1 40); do
+                ip_ue=$(sudo ip netns exec ue$k ip -o -4 addr show 2>/dev/null | grep oaitun | awk '{print $4}' | cut -d/ -f1)
+                [ -n "$ip_ue" ] && break
+                pgrep -f "ue$k.conf" > /dev/null || break
+                sleep 3
+              done
+              [ -n "$ip_ue" ] && break
+              sudo pkill -f "ue$k.conf" || true; sleep 15
+            done
+            echo "UE$k adresse ${ip_ue:-aucune}"; echo "ue${k}_ip=${ip_ue:-aucune}" >> "$LOGS/09_etapes.txt"
+            if [ -n "$ip_ue" ]; then
+              # sans cette route, le trafic de l'UE vers le réseau de données n'a aucun chemin
+              # (« Network is unreachable ») : ni trafic bénin, ni attaque, rien dans le tunnel GTP-U
+              tun=$(sudo ip netns exec ue$k ip -o -4 addr show | awk '/oaitun/{print $2; exit}')
+              sudo ip netns exec ue$k ip route replace 192.168.70.0/24 dev "$tun"
+              sudo ip netns exec ue$k ip route | sed "s/^/ue$k route: /" >> "$LOGS/09_routes.txt"
+              if sudo ip netns exec ue$k ping -c 3 -W 3 192.168.70.135 > "$LOGS/09_ping_ue$k.txt" 2>&1; then
+                echo "ue${k}_ping=ok" >> "$LOGS/09_etapes.txt"
+              else
+                echo "ue${k}_ping=echec" >> "$LOGS/09_etapes.txt"; echo "::error::UE$k ne joint pas le réseau de données (voir 09_ping_ue$k.txt)"
+              fi
+            fi
+            [ -n "$ip_ue" ] && UES="${UES:+$UES,}ue$k:$ip_ue"
+            sleep 20
+          done
+          }
+          if [ "${SANS_UES:-non}" = oui ]; then   # tranches d'essais : les UE sont connectés essai par essai (campagne.sh)
+            echo "UES=" >> "$GITHUB_ENV"; echo "nb_ue=0 (connexion essai par essai)" >> "$LOGS/09_etapes.txt"
+            exit 0
+          fi
+          connecter_ues
+          if [ "$(echo "$UES" | tr ',' '\n' | grep -c .)" -lt 2 ]; then
+            # seconde chance : tout le cœur (sauf la base) recréé, gNB et UE relancés
+            echo "::warning::UE non connectés : recréation du cœur 5G et nouvel essai"
+            etat_coeur ues_etape7_essai1
+            sudo pkill -f nr-uesoftmodem; sudo pkill -f nr-softmodem; sleep 5
+            reparer_coeur ues_etape7 complet
+            lancer_gnb "$GNB_CONF" "" || echo "::error::le gNB ne s'attache pas à l'AMF ou au RIC"
+            poser_goulot
+            sed -i '/^ue[12]_\(ip\|ping\)=/d' "$LOGS/09_etapes.txt"; echo "ues_seconde_chance=oui" >> "$LOGS/09_etapes.txt"
+            connecter_ues
+          fi
+          echo "UES=$UES" >> "$GITHUB_ENV"
+          echo "les deux UEs : $UES"
+          n_ue=$(echo "$UES" | tr ',' '\n' | grep -c . )
+          echo "nb_ue=$n_ue" >> "$LOGS/09_etapes.txt"
+          [ "$n_ue" -eq 2 ] || echo "::error::seulement $n_ue UE(s) connecté(s) sur 2 : la suite ne peut pas fonctionner"
+          [ "$n_ue" -eq 2 ] || etat_coeur fin_etape7
+          PLAT_F4_EOF
+          cat > "$WORK/py/bilan_faisabilite.py" <<'BILAN_F4_EOF'
+          #!/usr/bin/env python3
+          """
+          xML5G - bilan du test de faisabilité à plusieurs UE (novembre 2026).
+
+          Lit les journaux d'UNE configuration (un dossier de journaux de campagne.sh) et écrit :
+            F_bilan.json   toutes les mesures, essai par essai et résumées ;
+            F_bilan.md     le résumé lisible.
+          Avec --synthese D1 D2 ... : réunit les F_bilan.json de plusieurs configurations dans un tableau.
+
+          Aucune dépendance hors de la bibliothèque standard. Les définitions suivent celles de la campagne finale :
+            - un verdict est « d'attaque » si son intervalle de 0,2 s contient au moins un paquet d'inondation
+              (8e champ de la ligne V du détecteur) ;
+            - une libération est comptée quand la xApp journalise RELEASE ... result=ACK ;
+            - le délai de libération est mesuré, comme dans l'article, du premier paquet d'inondation arrivé au N3
+              (heure du noyau, colonne tk du journal de paquets 68_pkt_*.csv.gz) à l'acquittement E2 de la libération ;
+              le délai depuis le LANCEMENT de l'outil d'inondation (62_ev_*.jsonl) est donné en plus.
+          """
+          import argparse, csv, glob, gzip, json, os, re, statistics, sys
+
+          RE_REL = re.compile(r"\[XML5G\] RELEASE ran_ue_id=(\d+) policy=\S+ t_first_alarm_rx_us=(-?\d+) t_decision_us=(\d+) "
+                              r"t_ctrl_send_us=(\d+) t_ctrl_ack_us=(\d+) result=(\S+)")
+          RE_WOULD = re.compile(r"\[XML5G\] WOULD_RELEASE ran_ue_id=(\d+) t_us=(\d+)")
+          RE_XV = re.compile(r"\[XML5G\] V t_rx_us=(\d+) teid=(\d+) ran_ue_id=(\d+) v=(\d)")
+          RE_HDR = re.compile(r"\[XML5G\] policy=(\S+) W=(\d+) theta=([\d.]+) K=(\d+)")
+          RE_PING = re.compile(r"^\[(\d+\.\d+)\].*time=([\d.]+) ms")
+
+
+          def ouvrir(p):
+              return open(p, encoding="utf-8", errors="replace") if os.path.exists(p) else None
+
+
+          def med(v):
+              v = [x for x in v if x is not None]
+              return statistics.median(v) if v else None
+
+
+          def arr(x, d=1):
+              return None if x is None else round(x, d)
+
+
+          def lire_etapes(d):
+              r = {}
+              f = ouvrir(os.path.join(d, "09_etapes.txt"))
+              if f:
+                  for l in f:
+                      if "=" in l:
+                          k, v = l.strip().split("=", 1)
+                          r.setdefault(k, v)
+              return r
+
+
+          def lire_validite(d):
+              r = {}
+              f = ouvrir(os.path.join(d, "63_validite.txt"))
+              if f:
+                  for l in f:
+                      p = l.split()
+                      if len(p) >= 2:
+                          r[p[0]] = (p[1] == "valide", " ".join(p[2:]))
+              return r
+
+
+          def lire_roles(d):
+              r = {}
+              f = ouvrir(os.path.join(d, "63_ues_par_politique.txt"))
+              if f:
+                  for l in f:
+                      m = re.match(r"^(\S+) : attaquants=(\S*) b\S*nins=(\S*)", l.strip())
+                      if not m:
+                          continue
+                      x = {}
+                      for grp, role in ((m.group(2), "attaquant"), (m.group(3), "benin")):
+                          for u in grp.split(","):
+                              if ":" in u:
+                                  ns, ip = u.split(":", 1)
+                                  x[ip] = (role, ns)
+                      r[m.group(1)] = x
+              return r
+
+
+          def lire_ids(p):
+              ver, tip, sauts = {}, {}, 0
+              f = ouvrir(p)
+              if not f:
+                  return ver, tip, sauts
+              for l in f:
+                  q = l.split()
+                  if not q:
+                      continue
+                  if q[0] == "V" and len(q) >= 8:
+                      try:
+                          t = int(q[1]) / 1e6; teid = int(q[2]); ip = q[3]; v = int(q[4]); nfl = int(q[7])
+                          lag = int(q[9]) / 1e6 if len(q) > 9 else None
+                      except ValueError:
+                          continue
+                      tip[teid] = ip
+                      ver.setdefault(ip, []).append((t, v, nfl, lag))
+                  elif q[0] == "S" and len(q) >= 3:
+                      try:
+                          sauts += int(q[2])
+                      except ValueError:
+                          pass
+              for ip in ver:
+                  ver[ip].sort()
+              return ver, tip, sauts
+
+
+          def lire_xapp(p):
+              x = dict(hdr=None, rel=[], would=[], ran_teid={}, connecte=False)
+              f = ouvrir(p)
+              if not f:
+                  return x
+              for l in f:
+                  if "[XML5G]" not in l:
+                      continue
+                  m = RE_XV.search(l)
+                  if m:
+                      x["ran_teid"].setdefault(int(m.group(3)), set()).add(int(m.group(2)))
+                      continue
+                  m = RE_REL.search(l)
+                  if m:
+                      x["rel"].append(dict(ran=int(m.group(1)), t_dec=int(m.group(3)) / 1e6, t_ack=int(m.group(5)) / 1e6,
+                                           ok=m.group(6) == "ACK"))
+                      continue
+                  m = RE_WOULD.search(l)
+                  if m:
+                      x["would"].append((int(m.group(1)), int(m.group(2)) / 1e6))
+                      continue
+                  m = RE_HDR.search(l)
+                  if m:
+                      x["hdr"] = dict(W=int(m.group(2)), K=int(m.group(4)))
+                      continue
+                  if "détecteur connecté" in l:
+                      x["connecte"] = True
+              return x
+
+
+          def lire_ev(p):
+              att = {}
+              f = ouvrir(p)
+              if not f:
+                  return att
+              for l in f.read().strip().splitlines():
+                  try:
+                      e = json.loads(l)
+                  except ValueError:
+                      continue
+                  if isinstance(e, dict) and "start" in e and e.get("ip") and not e.get("benign"):
+                      att[e["ip"]] = (float(e["start"]), float(e.get("end", e["start"])), e.get("type", ""))
+              return att
+
+
+          def lire_pidstat(p):
+              """moyenne, sur les secondes de l'essai, du %CPU cumulé par commande ; %wait du détecteur"""
+              f = ouvrir(p)
+              if not f:
+                  return {}
+              par_t, attente = {}, []
+              for l in f:
+                  q = l.split()
+                  if len(q) < 15 or q[0].startswith("#") or q[0] == "Linux":
+                      continue
+                  k = 2 if q[1] in ("AM", "PM") else 1
+                  try:
+                      wait, cpu = float(q[k + 5]), float(q[k + 6])
+                  except (ValueError, IndexError):
+                      continue
+                  cmd = q[-1]
+                  par_t.setdefault(q[0], {}).setdefault(cmd, 0.0)
+                  par_t[q[0]][cmd] += cpu
+                  if cmd == "python3":
+                      attente.append(wait)
+              r = {}
+              for cmd in ("nr-softmodem", "nr-uesoftmodem", "python3", "xapp_xml5g"):
+                  v = [x[cmd] for x in par_t.values() if cmd in x]
+                  if v:
+                      r[cmd] = sum(v) / len(v)
+              if attente:
+                  r["attente_detecteur"] = sum(attente) / len(attente)
+              return r
+
+
+          def lire_cpu(p):
+              """part du temps processeur occupée (tous cœurs) entre les deux relevés de /proc/stat"""
+              f = ouvrir(p)
+              if not f:
+                  return None
+              v = {}
+              for l in f:
+                  q = l.split()
+                  if len(q) >= 10 and q[2] == "cpu":
+                      try:
+                          v[q[0]] = [int(x) for x in q[3:11]]
+                      except ValueError:
+                          pass
+              if "avant" not in v or "apres" not in v:
+                  return None
+              d = [b - a for a, b in zip(v["avant"], v["apres"])]
+              tot = sum(d)
+              return None if tot <= 0 else 100.0 * (tot - d[3] - d[4]) / tot      # hors idle et iowait
+
+
+          def lire_rtt(p):
+              r = []
+              f = ouvrir(p)
+              if f:
+                  for l in f:
+                      m = RE_PING.match(l)
+                      if m:
+                          r.append((float(m.group(1)), float(m.group(2))))
+              return r
+
+
+          VERITE = {(17, 5555), (6, 80)}          # paquets d'inondation du scénario : UDP 5555 et TCP 80
+
+
+          def lire_paquets(p):
+              """par teid : [premier paquet d'inondation au N3, dernier, nombre de paquets d'inondation, nombre total]"""
+              res = {}
+              if not os.path.exists(p):
+                  return res
+              try:
+                  with gzip.open(p, "rt", errors="replace") as f:
+                      tete = (next(f, "") or "").strip().split(",")
+                      i_tk = tete.index("tk") if "tk" in tete else None
+                      for l in f:
+                          q = l.split(",")
+                          if len(q) < 7:
+                              continue
+                          try:
+                              t, teid, proto, dport = float(q[0]), int(q[1]), int(q[2]), int(q[6])
+                              tk = float(q[i_tk]) if i_tk is not None and len(q) > i_tk and q[i_tk].strip() else 0.0
+                          except ValueError:
+                              continue
+                          r = res.setdefault(teid, [None, None, 0, 0])
+                          r[3] += 1
+                          if (proto, dport) in VERITE:
+                              h = tk if tk > 0 else t
+                              r[2] += 1
+                              if r[0] is None or h < r[0]:
+                                  r[0] = h
+                              if r[1] is None or h > r[1]:
+                                  r[1] = h
+              except (OSError, EOFError):
+                  pass                                  # archive tronquée (arrêt brutal) : on garde ce qui a été lu
+              return res
+
+
+          def rejouer(seq, w, k):
+              """instant où « k des w derniers verdicts » se déclenche (fenêtre pleine exigée, comme la xApp), sinon None"""
+              for i in range(w, len(seq) + 1):
+                  if sum(v for _, v, _, _ in seq[i - w:i]) >= k:
+                      return seq[i - 1][0]
+              return None
+
+
+          def analyser_essai(d, meta, roles, validite):
+              run = meta["essai"]
+              ver, tip, sauts = lire_ids(os.path.join(d, f"61_ids_{run}.log"))
+              xa = lire_xapp(os.path.join(d, f"60_xapp_{run}.log"))
+              att = lire_ev(os.path.join(d, f"62_ev_{run}.jsonl"))
+              pq = {}
+              for teid, r in lire_paquets(os.path.join(d, f"68_pkt_{run}.csv.gz")).items():
+                  if teid in tip and r[2]:
+                      x = pq.setdefault(tip[teid], [r[0], r[1], 0])
+                      x[0] = min(x[0], r[0]); x[1] = max(x[1], r[1]); x[2] += r[2]
+              ran_ip = {}
+              for ran, teids in xa["ran_teid"].items():
+                  for t in teids:
+                      if t in tip:
+                          ran_ip[ran] = tip[t]
+              rel = {}
+              for r in xa["rel"]:
+                  if r["ok"] and r["ran"] in ran_ip:
+                      rel.setdefault(ran_ip[r["ran"]], r["t_ack"])
+              rel_sans_ip = sum(1 for r in xa["rel"] if r["ok"] and r["ran"] not in ran_ip)
+              duree = float(meta.get("duree_s") or 55)
+              ues = []
+              t_debut = min((s[0][0] for s in ver.values() if s), default=None)
+              for ip, (role, ns) in sorted((roles.get(run) or {}).items(), key=lambda z: z[1][1]):
+                  seq = ver.get(ip, [])
+                  a = att.get(ip)
+                  va = [x for x in seq if x[2] > 0]
+                  vh = [x for x in seq if x[2] == 0]
+                  u = dict(ns=ns, ip=ip, role=role, type=a[2] if a else "", verdicts=len(seq), alarmes=sum(x[1] for x in seq),
+                           verdicts_attaque=len(va), alarmes_attaque=sum(x[1] for x in va),
+                           verdicts_benins=len(vh), alarmes_benignes=sum(x[1] for x in vh),
+                           libere=ip in rel, delai_liberation_s=None, delai_depuis_lancement_s=None,
+                           attaque_duree_s=arr(a[1] - a[0], 1) if a else None,
+                           paquets_inondation_n3=pq[ip][2] if ip in pq else 0,
+                           debit_inondation_pps=arr(pq[ip][2] / max(0.2, pq[ip][1] - pq[ip][0]), 0) if ip in pq else None,
+                           inondation_apres_acquittement_s=None)
+                  if ip in rel and a:
+                      u["delai_depuis_lancement_s"] = arr(rel[ip] - a[0], 2)
+                  if ip in rel and ip in pq:
+                      u["delai_liberation_s"] = arr(rel[ip] - pq[ip][0], 2)
+                      u["inondation_apres_acquittement_s"] = arr(max(0.0, pq[ip][1] - rel[ip]), 2)
+                  for nom, (w, k) in (("7sur10", (10, 7)), ("7sur14", (14, 7))):
+                      t = rejouer(seq, w, k)
+                      u[f"rejeu_{nom}"] = t is not None
+                      u[f"rejeu_{nom}_delai_s"] = arr(t - pq[ip][0], 2) if (t is not None and ip in pq) else None
+                  # RTT de l'UE : avant toute attaque, puis pendant (jusqu'à la première libération s'il y en a une)
+                  rtt = []
+                  for pref in ("62_ev", "69_benin"):
+                      rtt += lire_rtt(os.path.join(d, f"{pref}_{run}_rtt_{ns}.txt"))
+                  if rtt and att:
+                      t0 = min(x[0] for x in att.values()); t1 = max(x[1] for x in att.values())
+                      u["rtt_avant_ms"] = arr(med([m for t, m in rtt if t < t0]), 1)
+                      u["rtt_pendant_ms"] = arr(med([m for t, m in rtt if t0 + 2 <= t <= t1]), 1)
+                  elif rtt:
+                      u["rtt_avant_ms"] = arr(med([m for _, m in rtt]), 1)
+                  ues.append(u)
+              ps = lire_pidstat(os.path.join(d, f"65_pidstat_{run}.txt"))
+              nue = max(1, len(ues))
+              retards = [x[3] for s in ver.values() for x in s if x[3] is not None]
+              ok, raison = validite.get(run, (False, "non terminé"))
+              return dict(essai=run, scenario=meta["scenario"], politique=meta["politique"], valide=ok, raison=raison,
+                          regle=xa["hdr"], ues=ues, liberations_sans_adresse=rel_sans_ip,
+                          verdicts_par_ue_s=arr(sum(len(s) for s in ver.values()) / nue / duree, 2) if ver else None,
+                          intervalles_sautes=sauts, retard_median_s=arr(med(retards), 2), retard_max_s=arr(max(retards), 1) if retards else None,
+                          cpu_gnb=arr(ps.get("nr-softmodem")), cpu_ues=arr(ps.get("nr-uesoftmodem")), cpu_detecteur=arr(ps.get("python3")),
+                          attente_detecteur=arr(ps.get("attente_detecteur")), machine_occupee_pct=arr(lire_cpu(os.path.join(d, f"66_cpu_{run}.txt"))))
+
+
+          def frac(a, b):
+              return f"{a}/{b}" if b else "—"
+
+
+          def pct(a, b):
+              return None if not b else round(100.0 * a / b, 1)
+
+
+          def resumer(d):
+              et = lire_etapes(d)
+              tr = {}
+              p = os.path.join(d, "63_tranche.json")
+              if os.path.exists(p):
+                  try:
+                      tr = json.load(open(p, encoding="utf-8"))
+                  except ValueError:
+                      tr = {}
+              validite, roles = lire_validite(d), lire_roles(d)
+              essais = []
+              p = os.path.join(d, "63_essais.csv")
+              if os.path.exists(p):
+                  for m in csv.DictReader(open(p, encoding="utf-8")):
+                      essais.append(analyser_essai(d, m, roles, validite))
+              lances = len(validite)
+              invalides = {}
+              for run, (ok, raison) in validite.items():
+                  if not ok:
+                      invalides[raison or "?"] = invalides.get(raison or "?", 0) + 1
+              val = [e for e in essais if e["valide"]]
+              cases = {}
+              for e in val:
+                  c = cases.setdefault(f"{e['scenario']}/{e['politique']}", dict(n=0, att=0, att_lib=0, ben=0, ben_lib=0, delais=[],
+                                                                                rejeu10_att=0, rejeu14_att=0, rejeu10_ben=0, rejeu14_ben=0,
+                                                                                delais10=[], delais14=[]))
+                  c["n"] += 1
+                  for u in e["ues"]:
+                      if u["role"] == "attaquant":
+                          c["att"] += 1; c["att_lib"] += u["libere"]
+                          if u["delai_liberation_s"] is not None:
+                              c["delais"].append(u["delai_liberation_s"])
+                          if u["debit_inondation_pps"] is not None:
+                              c.setdefault("pps", {}).setdefault(u["type"], []).append(u["debit_inondation_pps"])
+                          c["rejeu10_att"] += u["rejeu_7sur10"]; c["rejeu14_att"] += u["rejeu_7sur14"]
+                          if u["rejeu_7sur10_delai_s"] is not None:
+                              c["delais10"].append(u["rejeu_7sur10_delai_s"])
+                          if u["rejeu_7sur14_delai_s"] is not None:
+                              c["delais14"].append(u["rejeu_7sur14_delai_s"])
+                      else:
+                          c["ben"] += 1; c["ben_lib"] += u["libere"]
+                          c["rejeu10_ben"] += u["rejeu_7sur10"]; c["rejeu14_ben"] += u["rejeu_7sur14"]
+              for c in cases.values():
+                  c["debit_inondation_pps"] = {k: arr(med(x), 0) for k, x in c.pop("pps", {}).items()}
+                  c["delai_median_s"] = arr(med(c.pop("delais")), 1)
+                  c["rejeu10_delai_median_s"] = arr(med(c.pop("delais10")), 1)
+                  c["rejeu14_delai_median_s"] = arr(med(c.pop("delais14")), 1)
+              # détection au niveau du verdict, par type d'inondation, sur tous les essais valides (avant libération)
+              det = {}
+              fa = [0, 0]
+              for e in val:
+                  for u in e["ues"]:
+                      if u["role"] == "attaquant" and u["type"]:
+                          x = det.setdefault(u["type"], [0, 0]); x[0] += u["alarmes_attaque"]; x[1] += u["verdicts_attaque"]
+                      fa[0] += u["alarmes_benignes"]; fa[1] += u["verdicts_benins"]
+              ben_att = [u for e in val for u in e["ues"] if u["role"] == "benin" and e["scenario"] not in ("flash", "benin")]
+              return dict(
+                  config=tr.get("id") or os.path.basename(os.path.normpath(d)), nue=tr.get("nue") or et.get("nue"),
+                  charge=tr.get("charge"), profil_demande=tr.get("profil"), profil_obtenu=et.get("profil_radio"),
+                  ue_leger_selon_gnb=et.get("ue_leger_selon_gnb"), campagne=et.get("campagne"),
+                  essais_lances=lances, essais_valides=sum(1 for v in validite.values() if v[0]), invalides=invalides,
+                  cases=cases,
+                  detection_verdicts={k: dict(alarmes=v[0], verdicts=v[1], pct=pct(*v)) for k, v in det.items()},
+                  fausses_alarmes=dict(alarmes=fa[0], verdicts=fa[1], pct=pct(*fa)),
+                  verdicts_par_ue_s=arr(med([e["verdicts_par_ue_s"] for e in val]), 2),
+                  intervalles_sautes_median=med([e["intervalles_sautes"] for e in val]),
+                  retard_median_s=arr(med([e["retard_median_s"] for e in val]), 2),
+                  cpu_gnb=arr(med([e["cpu_gnb"] for e in val])), cpu_ues=arr(med([e["cpu_ues"] for e in val])),
+                  cpu_detecteur=arr(med([e["cpu_detecteur"] for e in val])), attente_detecteur=arr(med([e["attente_detecteur"] for e in val])),
+                  machine_occupee_pct=arr(med([e["machine_occupee_pct"] for e in val])),
+                  rtt_benin_avant_ms=arr(med([u.get("rtt_avant_ms") for u in ben_att]), 1),
+                  rtt_benin_pendant_ms=arr(med([u.get("rtt_pendant_ms") for u in ben_att]), 1),
+                  essais=essais)
+
+
+          def v(x, suf=""):
+              return "—" if x is None else f"{x}{suf}"
+
+
+          def markdown(b):
+              L = [f"### Configuration {b['config']} : {v(b['nue'])} UE, profil radio demandé {v(b['profil_demande'])}, obtenu {v(b['profil_obtenu'])}, charge {v(b['charge'])}", ""]
+              if b.get("profil_demande") and b.get("profil_obtenu") and b["profil_demande"] != b["profil_obtenu"]:
+                  L += [f"**Le profil radio demandé ({b['profil_demande']}) n'a pas fonctionné.** Les essais n'ont pas été lancés.", ""]
+              L += [f"- Essais lancés : {b['essais_lances']} ; valides : {b['essais_valides']}"
+                    + (" ; invalides : " + ", ".join(f"{k} × {n}" for k, n in b["invalides"].items()) if b["invalides"] else ""),
+                    f"- Verdicts par UE et par seconde (médiane) : {v(b['verdicts_par_ue_s'])} ; intervalles sautés par essai : {v(b['intervalles_sautes_median'])} ; retard médian d'un verdict : {v(b['retard_median_s'], ' s')}",
+                    f"- Processeur (% d'un cœur, médiane) : gNB {v(b['cpu_gnb'])}, tous les UE {v(b['cpu_ues'])}, détecteur {v(b['cpu_detecteur'])} (en attente du processeur {v(b['attente_detecteur'], ' %')}) ; machine occupée à {v(b['machine_occupee_pct'], ' %')}",
+                    "- Détection au niveau du verdict : " + (", ".join(f"{k} {x['alarmes']}/{x['verdicts']} ({v(x['pct'], ' %')})" for k, x in sorted(b["detection_verdicts"].items())) or "—")
+                    + f" ; fausses alarmes {b['fausses_alarmes']['alarmes']}/{b['fausses_alarmes']['verdicts']} ({v(b['fausses_alarmes']['pct'], ' %')})",
+                    f"- RTT de l'UE bénin pendant l'attaque (médiane) : {v(b['rtt_benin_avant_ms'], ' ms')} avant, {v(b['rtt_benin_pendant_ms'], ' ms')} pendant", ""]
+              if b["cases"]:
+                  L += ["Délais : du premier paquet d'inondation au N3 à l'acquittement E2 (libération) ou au déclenchement de la règle (rejeu sur les verdicts de l'essai).", "",
+                        "| Scénario / politique | Essais valides | Attaquants libérés | UE bénins libérés | Délai médian (s) | Inondation au N3 (paquets/s) | Rejeu 7 sur 10 : attaquants, bénins | Rejeu 7 sur 14 : attaquants, bénins |",
+                        "|---|---|---|---|---|---|---|---|"]
+                  for k in sorted(b["cases"]):
+                      c = b["cases"][k]
+                      pps = ", ".join(f"{t} {int(x)}" for t, x in sorted(c["debit_inondation_pps"].items()) if x is not None) or "—"
+                      L.append(f"| {k} | {c['n']} | {frac(c['att_lib'], c['att'])} | {frac(c['ben_lib'], c['ben'])} | {v(c['delai_median_s'])} | {pps} | "
+                               f"{frac(c['rejeu10_att'], c['att'])}, {frac(c['rejeu10_ben'], c['ben'])} ({v(c['rejeu10_delai_median_s'], ' s')}) | "
+                               f"{frac(c['rejeu14_att'], c['att'])}, {frac(c['rejeu14_ben'], c['ben'])} ({v(c['rejeu14_delai_median_s'], ' s')}) |")
+                  L.append("")
+              return "\n".join(L)
+
+
+          def synthese(dossiers, sortie):
+              B = []
+              for d in dossiers:
+                  for p in sorted(glob.glob(os.path.join(d, "**", "F_bilan.json"), recursive=True)):
+                      try:
+                          B.append(json.load(open(p, encoding="utf-8")))
+                      except ValueError:
+                          pass
+              B.sort(key=lambda b: str(b.get("config")))
+              L = ["# xML5G — test de faisabilité à plusieurs UE", "",
+                   "Référence (campagne finale, 2 UE, 106 PRB) : environ 1,5 verdict par UE et par seconde ; un attaquant, libéré dans 33 essais sur 33 par 7 sur 10.", "",
+                   "| Configuration | UE | Profil obtenu | Essais valides / lancés | Verdicts par UE et par s | Machine occupée | multi, 7 sur 10 : attaquants libérés, bénins libérés | multi, 7 sur 14 : attaquants libérés, bénins libérés | foule bénigne : bénins libérés (7 sur 10, 7 sur 14) |",
+                   "|---|---|---|---|---|---|---|---|---|"]
+
+              def case(b, k):
+                  c = b["cases"].get(k)
+                  return "—" if not c else f"{frac(c['att_lib'], c['att'])}, {frac(c['ben_lib'], c['ben'])}"
+
+              def foule(b, k):
+                  c = b["cases"].get(k)
+                  return "—" if not c else frac(c["ben_lib"], c["ben"])
+              for b in B:
+                  sc = "multi" if any(k.startswith("multi/") for k in b["cases"]) else "udp"
+                  L.append(f"| {b['config']} | {v(b['nue'])} | {v(b['profil_obtenu'])} | {b['essais_valides']} / {b['essais_lances']} | {v(b['verdicts_par_ue_s'])} | "
+                           f"{v(b['machine_occupee_pct'], ' %')} | {case(b, sc + '/xml5g')}{' (udp)' if sc == 'udp' else ''} | {case(b, sc + '/xml5g714')} | "
+                           f"{foule(b, 'flash/xml5g')}, {foule(b, 'flash/xml5g714')} |")
+              L.append("")
+              for b in B:
+                  L.append(markdown(b))
+              os.makedirs(sortie, exist_ok=True)
+              open(os.path.join(sortie, "FAISABILITE.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
+              json.dump(B, open(os.path.join(sortie, "FAISABILITE.json"), "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+              print("\n".join(L))
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("dossiers", nargs="+")
+              ap.add_argument("--synthese", default="", help="dossier de sortie de la synthèse de plusieurs configurations")
+              a = ap.parse_args()
+              if a.synthese:
+                  synthese(a.dossiers, a.synthese)
+                  return
+              d = a.dossiers[0]
+              b = resumer(d)
+              json.dump(b, open(os.path.join(d, "F_bilan.json"), "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+              md = markdown(b)
+              open(os.path.join(d, "F_bilan.md"), "w", encoding="utf-8").write(md + "\n")
+              print(md)
+
+
+          if __name__ == "__main__":
+              main()
+          BILAN_F4_EOF
+          chmod +x "$WORK/py/"*.sh
+          { for f in scenario.py campagne.sh plateforme.sh; do echo "===== $f"; diff "$WORK/py_fige/$f" "$WORK/py/$f"; done; } > "$LOGS/03_scripts_modifies.txt" 2>&1 || true
+          { echo "scripts identiques au paquet figé :"; for f in "$WORK/py_fige/"*; do n=$(basename "$f"); cmp -s "$f" "$WORK/py/$n" && echo "  $n"; done; } >> "$LOGS/03_scripts_modifies.txt"
+          bash -n "$WORK/py/campagne.sh" && bash -n "$WORK/py/plateforme.sh" && python3 -m py_compile "$WORK/py/scenario.py" "$WORK/py/bilan_faisabilite.py"
+          echo "scripts_multi_ue=ok" >> "$LOGS/09_etapes.txt"
+      - name: 5. Compiler OAI — environ 8 min
+        run: |
+
+          cd "$WORK/oai/cmake_targets"
+          ./build_oai -I > "$LOGS/04_oai_dep.log" 2>&1 || { tail -40 "$LOGS/04_oai_dep.log"; exit 1; }
+          ./build_oai -w SIMU --gNB --nrUE --build-e2 --cmake-opt -DE2AP_VERSION=E2AP_V3 --cmake-opt -DKPM_VERSION=KPM_V3_00 --ninja > "$LOGS/05_oai.log" 2>&1 || { tail -60 "$LOGS/05_oai.log"; exit 1; }
+          ls ran_build/build/nr-softmodem ran_build/build/nr-uesoftmodem
+          echo "oai_compile=ok" >> "$LOGS/09_etapes.txt"
+      - name: 6. Compiler FlexRIC, le RIC et les deux xApps
+        run: |
+
+          sudo apt-get install -y -q libpcre2-dev libsctp-dev > /dev/null
+          cd "$WORK/oai/openair2/E2AP/flexric" && mkdir -p build && cd build
+          cmake -GNinja -DE2AP_VERSION=E2AP_V3 -DKPM_VERSION=KPM_V3_00 -DCMAKE_BUILD_TYPE=Release .. > "$LOGS/06_fr_cmake.log" 2>&1
+          ninja -j"$(nproc)" > "$LOGS/07_fr.log" 2>&1 || { tail -50 "$LOGS/07_fr.log"; exit 1; }
+          sudo ninja install > /dev/null 2>&1
+          SM_DIR="$(dirname "$(find /usr/local -name librc_sm.so | head -1)")"; echo "SM_DIR=$SM_DIR" >> "$GITHUB_ENV"
+          FR_CONF="$(find /usr/local/etc -name flexric.conf | head -1)"; echo "FR_CONF=${FR_CONF:-$WORK/oai/openair2/E2AP/flexric/flexric.conf}" >> "$GITHUB_ENV"
+          ls examples/ric/nearRT-RIC examples/xApp/c/rc_release/xapp_rc_release examples/xApp/c/xapp_xml5g/xapp_xml5g examples/xApp/c/monitor/xapp_kpm_moni
+          echo "flexric_compile=ok" >> "$LOGS/09_etapes.txt"
+      - name: 7. Démarrer le cœur 5G, le RIC et le gNB (profil radio de la configuration)
+        continue-on-error: true
+        env:
+          SANS_UES: "oui"
+        run: bash "$WORK/py/plateforme.sh"
+      - name: 8. Essais de la configuration
+        continue-on-error: true
+        run: |
+          p=$(grep -m1 '^profil_radio=' "$LOGS/09_etapes.txt" 2>/dev/null | cut -d= -f2 || true)
+          if [ "$p" != "$PROFIL_FORCE" ]; then
+            echo "::warning::profil radio demandé ($PROFIL_FORCE) non obtenu (${p:-aucun}) : essais non lancés pour cette configuration"
+            echo "campagne=annulee_profil_non_obtenu" >> "$LOGS/09_etapes.txt"
+            exit 0
+          fi
+          bash "$WORK/py/campagne.sh"
+      - name: 9. Bilan de la configuration
+        if: always()
+        run: |
+          ( set +e +o pipefail; . "$WORK/py/coeur.sh"; etat_coeur fin ) || true
+          for c in oai-amf oai-smf; do docker logs "$c" > "$LOGS/40_$c.log" 2>&1 || true; done
+          sudo chmod -R a+r "$LOGS" || true
+          python3 "$WORK/py/bilan_faisabilite.py" "$LOGS" > "$LOGS/F_bilan.log" 2>&1 || echo "::warning::bilan : voir F_bilan.log"
+          if [ -s "$LOGS/F_bilan.md" ]; then cat "$LOGS/F_bilan.md" >> "$GITHUB_STEP_SUMMARY"; else tail -20 "$LOGS/F_bilan.log" || true; fi
+          # extraits des journaux radio (les journaux complets restent dans l'artefact de la configuration)
+          {
+            for f in "$LOGS"/11_gnb*.log; do [ -f "$f" ] || continue
+              echo "== $(basename "$f") : RA échoués $(grep -c 'RA failed' "$f"), UE retirés $(grep -c 'Remove NR rnti' "$f"), NGSetupResponse $(grep -c 'Received NGSetupResponse' "$f"), E2 setup $(grep -c 'E2 SETUP RESPONSE rx' "$f")"
+            done
+            for f in "$LOGS"/12_ue*.log; do [ -f "$f" ] || continue
+              echo "== $(basename "$f") : synchronisations $(grep -c 'Initial sync successful' "$f"), résolutions de contention échouées $(grep -c 'Contention resolution failed' "$f"), sessions PDU $(grep -ci 'PDU SESSION ESTABLISHMENT ACCEPT' "$f"), refus $(grep -cE 'Illegal_UE|Authentication Reject' "$f")"
+            done
+            for f in "$LOGS"/11_gnb_essai_leger.log "$LOGS"/12_ue1_essai_leger.log; do [ -f "$f" ] || continue
+              echo; echo "===== $(basename "$f") : 60 dernières lignes"; tail -n 60 "$f" | cut -c1-240
+            done
+          } > "$LOGS/F_extraits_radio.txt" 2>&1 || true
+          sudo chmod -R a+r "$LOGS" || true
+      - name: 10. Journaux de la configuration (artefact au nom unique)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xml5g-f4-${{ matrix.id }}
+          path: /home/runner/xml5g-journaux
+          retention-days: 90
+
+  synthese:
+    needs: [plan, essais]
+    if: ${{ always() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 1. Journaux de toutes les configurations
+        uses: actions/download-artifact@v4
+        with:
+          pattern: xml5g-f4-F-*
+          path: tout
+      - name: 2. Synthèse et archive légère
+        run: |
+          cat > "bilan_faisabilite.py" <<'BILAN_SYN_EOF'
+          #!/usr/bin/env python3
+          """
+          xML5G - bilan du test de faisabilité à plusieurs UE (novembre 2026).
+
+          Lit les journaux d'UNE configuration (un dossier de journaux de campagne.sh) et écrit :
+            F_bilan.json   toutes les mesures, essai par essai et résumées ;
+            F_bilan.md     le résumé lisible.
+          Avec --synthese D1 D2 ... : réunit les F_bilan.json de plusieurs configurations dans un tableau.
+
+          Aucune dépendance hors de la bibliothèque standard. Les définitions suivent celles de la campagne finale :
+            - un verdict est « d'attaque » si son intervalle de 0,2 s contient au moins un paquet d'inondation
+              (8e champ de la ligne V du détecteur) ;
+            - une libération est comptée quand la xApp journalise RELEASE ... result=ACK ;
+            - le délai de libération est mesuré, comme dans l'article, du premier paquet d'inondation arrivé au N3
+              (heure du noyau, colonne tk du journal de paquets 68_pkt_*.csv.gz) à l'acquittement E2 de la libération ;
+              le délai depuis le LANCEMENT de l'outil d'inondation (62_ev_*.jsonl) est donné en plus.
+          """
+          import argparse, csv, glob, gzip, json, os, re, statistics, sys
+
+          RE_REL = re.compile(r"\[XML5G\] RELEASE ran_ue_id=(\d+) policy=\S+ t_first_alarm_rx_us=(-?\d+) t_decision_us=(\d+) "
+                              r"t_ctrl_send_us=(\d+) t_ctrl_ack_us=(\d+) result=(\S+)")
+          RE_WOULD = re.compile(r"\[XML5G\] WOULD_RELEASE ran_ue_id=(\d+) t_us=(\d+)")
+          RE_XV = re.compile(r"\[XML5G\] V t_rx_us=(\d+) teid=(\d+) ran_ue_id=(\d+) v=(\d)")
+          RE_HDR = re.compile(r"\[XML5G\] policy=(\S+) W=(\d+) theta=([\d.]+) K=(\d+)")
+          RE_PING = re.compile(r"^\[(\d+\.\d+)\].*time=([\d.]+) ms")
+
+
+          def ouvrir(p):
+              return open(p, encoding="utf-8", errors="replace") if os.path.exists(p) else None
+
+
+          def med(v):
+              v = [x for x in v if x is not None]
+              return statistics.median(v) if v else None
+
+
+          def arr(x, d=1):
+              return None if x is None else round(x, d)
+
+
+          def lire_etapes(d):
+              r = {}
+              f = ouvrir(os.path.join(d, "09_etapes.txt"))
+              if f:
+                  for l in f:
+                      if "=" in l:
+                          k, v = l.strip().split("=", 1)
+                          r.setdefault(k, v)
+              return r
+
+
+          def lire_validite(d):
+              r = {}
+              f = ouvrir(os.path.join(d, "63_validite.txt"))
+              if f:
+                  for l in f:
+                      p = l.split()
+                      if len(p) >= 2:
+                          r[p[0]] = (p[1] == "valide", " ".join(p[2:]))
+              return r
+
+
+          def lire_roles(d):
+              r = {}
+              f = ouvrir(os.path.join(d, "63_ues_par_politique.txt"))
+              if f:
+                  for l in f:
+                      m = re.match(r"^(\S+) : attaquants=(\S*) b\S*nins=(\S*)", l.strip())
+                      if not m:
+                          continue
+                      x = {}
+                      for grp, role in ((m.group(2), "attaquant"), (m.group(3), "benin")):
+                          for u in grp.split(","):
+                              if ":" in u:
+                                  ns, ip = u.split(":", 1)
+                                  x[ip] = (role, ns)
+                      r[m.group(1)] = x
+              return r
+
+
+          def lire_ids(p):
+              ver, tip, sauts = {}, {}, 0
+              f = ouvrir(p)
+              if not f:
+                  return ver, tip, sauts
+              for l in f:
+                  q = l.split()
+                  if not q:
+                      continue
+                  if q[0] == "V" and len(q) >= 8:
+                      try:
+                          t = int(q[1]) / 1e6; teid = int(q[2]); ip = q[3]; v = int(q[4]); nfl = int(q[7])
+                          lag = int(q[9]) / 1e6 if len(q) > 9 else None
+                      except ValueError:
+                          continue
+                      tip[teid] = ip
+                      ver.setdefault(ip, []).append((t, v, nfl, lag))
+                  elif q[0] == "S" and len(q) >= 3:
+                      try:
+                          sauts += int(q[2])
+                      except ValueError:
+                          pass
+              for ip in ver:
+                  ver[ip].sort()
+              return ver, tip, sauts
+
+
+          def lire_xapp(p):
+              x = dict(hdr=None, rel=[], would=[], ran_teid={}, connecte=False)
+              f = ouvrir(p)
+              if not f:
+                  return x
+              for l in f:
+                  if "[XML5G]" not in l:
+                      continue
+                  m = RE_XV.search(l)
+                  if m:
+                      x["ran_teid"].setdefault(int(m.group(3)), set()).add(int(m.group(2)))
+                      continue
+                  m = RE_REL.search(l)
+                  if m:
+                      x["rel"].append(dict(ran=int(m.group(1)), t_dec=int(m.group(3)) / 1e6, t_ack=int(m.group(5)) / 1e6,
+                                           ok=m.group(6) == "ACK"))
+                      continue
+                  m = RE_WOULD.search(l)
+                  if m:
+                      x["would"].append((int(m.group(1)), int(m.group(2)) / 1e6))
+                      continue
+                  m = RE_HDR.search(l)
+                  if m:
+                      x["hdr"] = dict(W=int(m.group(2)), K=int(m.group(4)))
+                      continue
+                  if "détecteur connecté" in l:
+                      x["connecte"] = True
+              return x
+
+
+          def lire_ev(p):
+              att = {}
+              f = ouvrir(p)
+              if not f:
+                  return att
+              for l in f.read().strip().splitlines():
+                  try:
+                      e = json.loads(l)
+                  except ValueError:
+                      continue
+                  if isinstance(e, dict) and "start" in e and e.get("ip") and not e.get("benign"):
+                      att[e["ip"]] = (float(e["start"]), float(e.get("end", e["start"])), e.get("type", ""))
+              return att
+
+
+          def lire_pidstat(p):
+              """moyenne, sur les secondes de l'essai, du %CPU cumulé par commande ; %wait du détecteur"""
+              f = ouvrir(p)
+              if not f:
+                  return {}
+              par_t, attente = {}, []
+              for l in f:
+                  q = l.split()
+                  if len(q) < 15 or q[0].startswith("#") or q[0] == "Linux":
+                      continue
+                  k = 2 if q[1] in ("AM", "PM") else 1
+                  try:
+                      wait, cpu = float(q[k + 5]), float(q[k + 6])
+                  except (ValueError, IndexError):
+                      continue
+                  cmd = q[-1]
+                  par_t.setdefault(q[0], {}).setdefault(cmd, 0.0)
+                  par_t[q[0]][cmd] += cpu
+                  if cmd == "python3":
+                      attente.append(wait)
+              r = {}
+              for cmd in ("nr-softmodem", "nr-uesoftmodem", "python3", "xapp_xml5g"):
+                  v = [x[cmd] for x in par_t.values() if cmd in x]
+                  if v:
+                      r[cmd] = sum(v) / len(v)
+              if attente:
+                  r["attente_detecteur"] = sum(attente) / len(attente)
+              return r
+
+
+          def lire_cpu(p):
+              """part du temps processeur occupée (tous cœurs) entre les deux relevés de /proc/stat"""
+              f = ouvrir(p)
+              if not f:
+                  return None
+              v = {}
+              for l in f:
+                  q = l.split()
+                  if len(q) >= 10 and q[2] == "cpu":
+                      try:
+                          v[q[0]] = [int(x) for x in q[3:11]]
+                      except ValueError:
+                          pass
+              if "avant" not in v or "apres" not in v:
+                  return None
+              d = [b - a for a, b in zip(v["avant"], v["apres"])]
+              tot = sum(d)
+              return None if tot <= 0 else 100.0 * (tot - d[3] - d[4]) / tot      # hors idle et iowait
+
+
+          def lire_rtt(p):
+              r = []
+              f = ouvrir(p)
+              if f:
+                  for l in f:
+                      m = RE_PING.match(l)
+                      if m:
+                          r.append((float(m.group(1)), float(m.group(2))))
+              return r
+
+
+          VERITE = {(17, 5555), (6, 80)}          # paquets d'inondation du scénario : UDP 5555 et TCP 80
+
+
+          def lire_paquets(p):
+              """par teid : [premier paquet d'inondation au N3, dernier, nombre de paquets d'inondation, nombre total]"""
+              res = {}
+              if not os.path.exists(p):
+                  return res
+              try:
+                  with gzip.open(p, "rt", errors="replace") as f:
+                      tete = (next(f, "") or "").strip().split(",")
+                      i_tk = tete.index("tk") if "tk" in tete else None
+                      for l in f:
+                          q = l.split(",")
+                          if len(q) < 7:
+                              continue
+                          try:
+                              t, teid, proto, dport = float(q[0]), int(q[1]), int(q[2]), int(q[6])
+                              tk = float(q[i_tk]) if i_tk is not None and len(q) > i_tk and q[i_tk].strip() else 0.0
+                          except ValueError:
+                              continue
+                          r = res.setdefault(teid, [None, None, 0, 0])
+                          r[3] += 1
+                          if (proto, dport) in VERITE:
+                              h = tk if tk > 0 else t
+                              r[2] += 1
+                              if r[0] is None or h < r[0]:
+                                  r[0] = h
+                              if r[1] is None or h > r[1]:
+                                  r[1] = h
+              except (OSError, EOFError):
+                  pass                                  # archive tronquée (arrêt brutal) : on garde ce qui a été lu
+              return res
+
+
+          def rejouer(seq, w, k):
+              """instant où « k des w derniers verdicts » se déclenche (fenêtre pleine exigée, comme la xApp), sinon None"""
+              for i in range(w, len(seq) + 1):
+                  if sum(v for _, v, _, _ in seq[i - w:i]) >= k:
+                      return seq[i - 1][0]
+              return None
+
+
+          def analyser_essai(d, meta, roles, validite):
+              run = meta["essai"]
+              ver, tip, sauts = lire_ids(os.path.join(d, f"61_ids_{run}.log"))
+              xa = lire_xapp(os.path.join(d, f"60_xapp_{run}.log"))
+              att = lire_ev(os.path.join(d, f"62_ev_{run}.jsonl"))
+              pq = {}
+              for teid, r in lire_paquets(os.path.join(d, f"68_pkt_{run}.csv.gz")).items():
+                  if teid in tip and r[2]:
+                      x = pq.setdefault(tip[teid], [r[0], r[1], 0])
+                      x[0] = min(x[0], r[0]); x[1] = max(x[1], r[1]); x[2] += r[2]
+              ran_ip = {}
+              for ran, teids in xa["ran_teid"].items():
+                  for t in teids:
+                      if t in tip:
+                          ran_ip[ran] = tip[t]
+              rel = {}
+              for r in xa["rel"]:
+                  if r["ok"] and r["ran"] in ran_ip:
+                      rel.setdefault(ran_ip[r["ran"]], r["t_ack"])
+              rel_sans_ip = sum(1 for r in xa["rel"] if r["ok"] and r["ran"] not in ran_ip)
+              duree = float(meta.get("duree_s") or 55)
+              ues = []
+              t_debut = min((s[0][0] for s in ver.values() if s), default=None)
+              for ip, (role, ns) in sorted((roles.get(run) or {}).items(), key=lambda z: z[1][1]):
+                  seq = ver.get(ip, [])
+                  a = att.get(ip)
+                  va = [x for x in seq if x[2] > 0]
+                  vh = [x for x in seq if x[2] == 0]
+                  u = dict(ns=ns, ip=ip, role=role, type=a[2] if a else "", verdicts=len(seq), alarmes=sum(x[1] for x in seq),
+                           verdicts_attaque=len(va), alarmes_attaque=sum(x[1] for x in va),
+                           verdicts_benins=len(vh), alarmes_benignes=sum(x[1] for x in vh),
+                           libere=ip in rel, delai_liberation_s=None, delai_depuis_lancement_s=None,
+                           attaque_duree_s=arr(a[1] - a[0], 1) if a else None,
+                           paquets_inondation_n3=pq[ip][2] if ip in pq else 0,
+                           debit_inondation_pps=arr(pq[ip][2] / max(0.2, pq[ip][1] - pq[ip][0]), 0) if ip in pq else None,
+                           inondation_apres_acquittement_s=None)
+                  if ip in rel and a:
+                      u["delai_depuis_lancement_s"] = arr(rel[ip] - a[0], 2)
+                  if ip in rel and ip in pq:
+                      u["delai_liberation_s"] = arr(rel[ip] - pq[ip][0], 2)
+                      u["inondation_apres_acquittement_s"] = arr(max(0.0, pq[ip][1] - rel[ip]), 2)
+                  for nom, (w, k) in (("7sur10", (10, 7)), ("7sur14", (14, 7))):
+                      t = rejouer(seq, w, k)
+                      u[f"rejeu_{nom}"] = t is not None
+                      u[f"rejeu_{nom}_delai_s"] = arr(t - pq[ip][0], 2) if (t is not None and ip in pq) else None
+                  # RTT de l'UE : avant toute attaque, puis pendant (jusqu'à la première libération s'il y en a une)
+                  rtt = []
+                  for pref in ("62_ev", "69_benin"):
+                      rtt += lire_rtt(os.path.join(d, f"{pref}_{run}_rtt_{ns}.txt"))
+                  if rtt and att:
+                      t0 = min(x[0] for x in att.values()); t1 = max(x[1] for x in att.values())
+                      u["rtt_avant_ms"] = arr(med([m for t, m in rtt if t < t0]), 1)
+                      u["rtt_pendant_ms"] = arr(med([m for t, m in rtt if t0 + 2 <= t <= t1]), 1)
+                  elif rtt:
+                      u["rtt_avant_ms"] = arr(med([m for _, m in rtt]), 1)
+                  ues.append(u)
+              ps = lire_pidstat(os.path.join(d, f"65_pidstat_{run}.txt"))
+              nue = max(1, len(ues))
+              retards = [x[3] for s in ver.values() for x in s if x[3] is not None]
+              ok, raison = validite.get(run, (False, "non terminé"))
+              return dict(essai=run, scenario=meta["scenario"], politique=meta["politique"], valide=ok, raison=raison,
+                          regle=xa["hdr"], ues=ues, liberations_sans_adresse=rel_sans_ip,
+                          verdicts_par_ue_s=arr(sum(len(s) for s in ver.values()) / nue / duree, 2) if ver else None,
+                          intervalles_sautes=sauts, retard_median_s=arr(med(retards), 2), retard_max_s=arr(max(retards), 1) if retards else None,
+                          cpu_gnb=arr(ps.get("nr-softmodem")), cpu_ues=arr(ps.get("nr-uesoftmodem")), cpu_detecteur=arr(ps.get("python3")),
+                          attente_detecteur=arr(ps.get("attente_detecteur")), machine_occupee_pct=arr(lire_cpu(os.path.join(d, f"66_cpu_{run}.txt"))))
+
+
+          def frac(a, b):
+              return f"{a}/{b}" if b else "—"
+
+
+          def pct(a, b):
+              return None if not b else round(100.0 * a / b, 1)
+
+
+          def resumer(d):
+              et = lire_etapes(d)
+              tr = {}
+              p = os.path.join(d, "63_tranche.json")
+              if os.path.exists(p):
+                  try:
+                      tr = json.load(open(p, encoding="utf-8"))
+                  except ValueError:
+                      tr = {}
+              validite, roles = lire_validite(d), lire_roles(d)
+              essais = []
+              p = os.path.join(d, "63_essais.csv")
+              if os.path.exists(p):
+                  for m in csv.DictReader(open(p, encoding="utf-8")):
+                      essais.append(analyser_essai(d, m, roles, validite))
+              lances = len(validite)
+              invalides = {}
+              for run, (ok, raison) in validite.items():
+                  if not ok:
+                      invalides[raison or "?"] = invalides.get(raison or "?", 0) + 1
+              val = [e for e in essais if e["valide"]]
+              cases = {}
+              for e in val:
+                  c = cases.setdefault(f"{e['scenario']}/{e['politique']}", dict(n=0, att=0, att_lib=0, ben=0, ben_lib=0, delais=[],
+                                                                                rejeu10_att=0, rejeu14_att=0, rejeu10_ben=0, rejeu14_ben=0,
+                                                                                delais10=[], delais14=[]))
+                  c["n"] += 1
+                  for u in e["ues"]:
+                      if u["role"] == "attaquant":
+                          c["att"] += 1; c["att_lib"] += u["libere"]
+                          if u["delai_liberation_s"] is not None:
+                              c["delais"].append(u["delai_liberation_s"])
+                          if u["debit_inondation_pps"] is not None:
+                              c.setdefault("pps", {}).setdefault(u["type"], []).append(u["debit_inondation_pps"])
+                          c["rejeu10_att"] += u["rejeu_7sur10"]; c["rejeu14_att"] += u["rejeu_7sur14"]
+                          if u["rejeu_7sur10_delai_s"] is not None:
+                              c["delais10"].append(u["rejeu_7sur10_delai_s"])
+                          if u["rejeu_7sur14_delai_s"] is not None:
+                              c["delais14"].append(u["rejeu_7sur14_delai_s"])
+                      else:
+                          c["ben"] += 1; c["ben_lib"] += u["libere"]
+                          c["rejeu10_ben"] += u["rejeu_7sur10"]; c["rejeu14_ben"] += u["rejeu_7sur14"]
+              for c in cases.values():
+                  c["debit_inondation_pps"] = {k: arr(med(x), 0) for k, x in c.pop("pps", {}).items()}
+                  c["delai_median_s"] = arr(med(c.pop("delais")), 1)
+                  c["rejeu10_delai_median_s"] = arr(med(c.pop("delais10")), 1)
+                  c["rejeu14_delai_median_s"] = arr(med(c.pop("delais14")), 1)
+              # détection au niveau du verdict, par type d'inondation, sur tous les essais valides (avant libération)
+              det = {}
+              fa = [0, 0]
+              for e in val:
+                  for u in e["ues"]:
+                      if u["role"] == "attaquant" and u["type"]:
+                          x = det.setdefault(u["type"], [0, 0]); x[0] += u["alarmes_attaque"]; x[1] += u["verdicts_attaque"]
+                      fa[0] += u["alarmes_benignes"]; fa[1] += u["verdicts_benins"]
+              ben_att = [u for e in val for u in e["ues"] if u["role"] == "benin" and e["scenario"] not in ("flash", "benin")]
+              return dict(
+                  config=tr.get("id") or os.path.basename(os.path.normpath(d)), nue=tr.get("nue") or et.get("nue"),
+                  charge=tr.get("charge"), profil_demande=tr.get("profil"), profil_obtenu=et.get("profil_radio"),
+                  ue_leger_selon_gnb=et.get("ue_leger_selon_gnb"), campagne=et.get("campagne"),
+                  essais_lances=lances, essais_valides=sum(1 for v in validite.values() if v[0]), invalides=invalides,
+                  cases=cases,
+                  detection_verdicts={k: dict(alarmes=v[0], verdicts=v[1], pct=pct(*v)) for k, v in det.items()},
+                  fausses_alarmes=dict(alarmes=fa[0], verdicts=fa[1], pct=pct(*fa)),
+                  verdicts_par_ue_s=arr(med([e["verdicts_par_ue_s"] for e in val]), 2),
+                  intervalles_sautes_median=med([e["intervalles_sautes"] for e in val]),
+                  retard_median_s=arr(med([e["retard_median_s"] for e in val]), 2),
+                  cpu_gnb=arr(med([e["cpu_gnb"] for e in val])), cpu_ues=arr(med([e["cpu_ues"] for e in val])),
+                  cpu_detecteur=arr(med([e["cpu_detecteur"] for e in val])), attente_detecteur=arr(med([e["attente_detecteur"] for e in val])),
+                  machine_occupee_pct=arr(med([e["machine_occupee_pct"] for e in val])),
+                  rtt_benin_avant_ms=arr(med([u.get("rtt_avant_ms") for u in ben_att]), 1),
+                  rtt_benin_pendant_ms=arr(med([u.get("rtt_pendant_ms") for u in ben_att]), 1),
+                  essais=essais)
+
+
+          def v(x, suf=""):
+              return "—" if x is None else f"{x}{suf}"
+
+
+          def markdown(b):
+              L = [f"### Configuration {b['config']} : {v(b['nue'])} UE, profil radio demandé {v(b['profil_demande'])}, obtenu {v(b['profil_obtenu'])}, charge {v(b['charge'])}", ""]
+              if b.get("profil_demande") and b.get("profil_obtenu") and b["profil_demande"] != b["profil_obtenu"]:
+                  L += [f"**Le profil radio demandé ({b['profil_demande']}) n'a pas fonctionné.** Les essais n'ont pas été lancés.", ""]
+              L += [f"- Essais lancés : {b['essais_lances']} ; valides : {b['essais_valides']}"
+                    + (" ; invalides : " + ", ".join(f"{k} × {n}" for k, n in b["invalides"].items()) if b["invalides"] else ""),
+                    f"- Verdicts par UE et par seconde (médiane) : {v(b['verdicts_par_ue_s'])} ; intervalles sautés par essai : {v(b['intervalles_sautes_median'])} ; retard médian d'un verdict : {v(b['retard_median_s'], ' s')}",
+                    f"- Processeur (% d'un cœur, médiane) : gNB {v(b['cpu_gnb'])}, tous les UE {v(b['cpu_ues'])}, détecteur {v(b['cpu_detecteur'])} (en attente du processeur {v(b['attente_detecteur'], ' %')}) ; machine occupée à {v(b['machine_occupee_pct'], ' %')}",
+                    "- Détection au niveau du verdict : " + (", ".join(f"{k} {x['alarmes']}/{x['verdicts']} ({v(x['pct'], ' %')})" for k, x in sorted(b["detection_verdicts"].items())) or "—")
+                    + f" ; fausses alarmes {b['fausses_alarmes']['alarmes']}/{b['fausses_alarmes']['verdicts']} ({v(b['fausses_alarmes']['pct'], ' %')})",
+                    f"- RTT de l'UE bénin pendant l'attaque (médiane) : {v(b['rtt_benin_avant_ms'], ' ms')} avant, {v(b['rtt_benin_pendant_ms'], ' ms')} pendant", ""]
+              if b["cases"]:
+                  L += ["Délais : du premier paquet d'inondation au N3 à l'acquittement E2 (libération) ou au déclenchement de la règle (rejeu sur les verdicts de l'essai).", "",
+                        "| Scénario / politique | Essais valides | Attaquants libérés | UE bénins libérés | Délai médian (s) | Inondation au N3 (paquets/s) | Rejeu 7 sur 10 : attaquants, bénins | Rejeu 7 sur 14 : attaquants, bénins |",
+                        "|---|---|---|---|---|---|---|---|"]
+                  for k in sorted(b["cases"]):
+                      c = b["cases"][k]
+                      pps = ", ".join(f"{t} {int(x)}" for t, x in sorted(c["debit_inondation_pps"].items()) if x is not None) or "—"
+                      L.append(f"| {k} | {c['n']} | {frac(c['att_lib'], c['att'])} | {frac(c['ben_lib'], c['ben'])} | {v(c['delai_median_s'])} | {pps} | "
+                               f"{frac(c['rejeu10_att'], c['att'])}, {frac(c['rejeu10_ben'], c['ben'])} ({v(c['rejeu10_delai_median_s'], ' s')}) | "
+                               f"{frac(c['rejeu14_att'], c['att'])}, {frac(c['rejeu14_ben'], c['ben'])} ({v(c['rejeu14_delai_median_s'], ' s')}) |")
+                  L.append("")
+              return "\n".join(L)
+
+
+          def synthese(dossiers, sortie):
+              B = []
+              for d in dossiers:
+                  for p in sorted(glob.glob(os.path.join(d, "**", "F_bilan.json"), recursive=True)):
+                      try:
+                          B.append(json.load(open(p, encoding="utf-8")))
+                      except ValueError:
+                          pass
+              B.sort(key=lambda b: str(b.get("config")))
+              L = ["# xML5G — test de faisabilité à plusieurs UE", "",
+                   "Référence (campagne finale, 2 UE, 106 PRB) : environ 1,5 verdict par UE et par seconde ; un attaquant, libéré dans 33 essais sur 33 par 7 sur 10.", "",
+                   "| Configuration | UE | Profil obtenu | Essais valides / lancés | Verdicts par UE et par s | Machine occupée | multi, 7 sur 10 : attaquants libérés, bénins libérés | multi, 7 sur 14 : attaquants libérés, bénins libérés | foule bénigne : bénins libérés (7 sur 10, 7 sur 14) |",
+                   "|---|---|---|---|---|---|---|---|---|"]
+
+              def case(b, k):
+                  c = b["cases"].get(k)
+                  return "—" if not c else f"{frac(c['att_lib'], c['att'])}, {frac(c['ben_lib'], c['ben'])}"
+
+              def foule(b, k):
+                  c = b["cases"].get(k)
+                  return "—" if not c else frac(c["ben_lib"], c["ben"])
+              for b in B:
+                  sc = "multi" if any(k.startswith("multi/") for k in b["cases"]) else "udp"
+                  L.append(f"| {b['config']} | {v(b['nue'])} | {v(b['profil_obtenu'])} | {b['essais_valides']} / {b['essais_lances']} | {v(b['verdicts_par_ue_s'])} | "
+                           f"{v(b['machine_occupee_pct'], ' %')} | {case(b, sc + '/xml5g')}{' (udp)' if sc == 'udp' else ''} | {case(b, sc + '/xml5g714')} | "
+                           f"{foule(b, 'flash/xml5g')}, {foule(b, 'flash/xml5g714')} |")
+              L.append("")
+              for b in B:
+                  L.append(markdown(b))
+              os.makedirs(sortie, exist_ok=True)
+              open(os.path.join(sortie, "FAISABILITE.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
+              json.dump(B, open(os.path.join(sortie, "FAISABILITE.json"), "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+              print("\n".join(L))
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("dossiers", nargs="+")
+              ap.add_argument("--synthese", default="", help="dossier de sortie de la synthèse de plusieurs configurations")
+              a = ap.parse_args()
+              if a.synthese:
+                  synthese(a.dossiers, a.synthese)
+                  return
+              d = a.dossiers[0]
+              b = resumer(d)
+              json.dump(b, open(os.path.join(d, "F_bilan.json"), "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+              md = markdown(b)
+              open(os.path.join(d, "F_bilan.md"), "w", encoding="utf-8").write(md + "\n")
+              print(md)
+
+
+          if __name__ == "__main__":
+              main()
+          BILAN_SYN_EOF
+          mkdir -p resultats
+          ls tout 2>/dev/null || { echo "::error::aucune configuration n'a produit de journaux"; exit 1; }
+          python3 bilan_faisabilite.py --synthese resultats tout/* > resultats/synthese.log 2>&1 || echo "::warning::synthèse : voir synthese.log"
+          if [ -s resultats/FAISABILITE.md ]; then cat resultats/FAISABILITE.md >> "$GITHUB_STEP_SUMMARY"; else tail -20 resultats/synthese.log || true; fi
+          # archive légère : tout sauf les gros journaux (radio complets, iperf3, paquets, compilation, cœur)
+          for d in tout/*/; do
+            n=$(basename "$d"); mkdir -p "resultats/$n"
+            find "$d" -maxdepth 1 -type f \
+              ! -name '11_gnb*' ! -name '12_ue*' ! -name '10_ric*' ! -name '64_iperf*' ! -name '68_pkt*' \
+              ! -name '04_*' ! -name '05_*' ! -name '06_*' ! -name '07_fr.log' ! -name '01_apt.log' \
+              ! -name '40_*' ! -name '41_*' ! -name '*.joblib' ! -name '*.tgz' -exec cp {} "resultats/$n/" \;
+          done
+          du -sh resultats tout || true
+      - name: 3. Archive à télécharger (xml5g-f4-RESULTATS)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xml5g-f4-RESULTATS
+          path: resultats
+          retention-days: 90
